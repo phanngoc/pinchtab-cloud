@@ -555,7 +555,91 @@ async def _execute_tool(
         return (f"ERROR: unknown tool '{name}'", False, None, None)
     except Exception as e:
         log.warning("tool %s raised: %s", name, e)
+        # Pinchtab errors get an actionable translation so the agent
+        # doesn't repeat the same failed action across turns.
+        from backend.pinchtab_client import PinchtabError
+        if isinstance(e, PinchtabError):
+            return (f"ERROR: {name} {_humanize_pinchtab_error(e)}", False, None, None)
         return (f"ERROR: {type(e).__name__}: {e}", False, None, None)
+
+
+# Map of pinchtab error fragments to actionable agent guidance. Keys are
+# substrings of pinchtab's `error` JSON field; first match wins. The point
+# is to translate noisy HTTP-500 JSON into one sentence Claude can act on
+# instead of repeating the same failed action across turns.
+_PINCHTAB_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "Node is detached from document",
+        "the element was removed from the DOM between snap and action "
+        "(page mutated). The next snap will reflect the new state — pick a "
+        "ref from that snap, not the previous one.",
+    ),
+    (
+        "Element is not focusable",
+        "the element isn't focusable. It may be disabled, covered by an "
+        "overlay, or not the true input field. Try `find_element` with a "
+        "natural description of the field you want, or click a parent "
+        "first to reveal the real input.",
+    ),
+    (
+        "navigation_changed",
+        "the page navigated to a new URL during your action. All refs from "
+        "the previous snap are now stale. Wait for the next snap and act "
+        "on its refs.",
+    ),
+    (
+        "element is hidden",
+        "the element has zero size (hidden/collapsed in the a11y tree). "
+        "Pick a different ref, or expand a parent menu/dropdown first.",
+    ),
+    (
+        "ref not found",
+        "the ref doesn't exist on this page. The snap may have changed; "
+        "re-read the latest snap above and pick a ref from it.",
+    ),
+    (
+        "element not visible",
+        "the element is in the DOM but not visible on screen. Try "
+        "`scroll` to bring it into view first, or pick a visible alternative.",
+    ),
+)
+
+
+def _humanize_pinchtab_error(exc) -> str:
+    """Translate a PinchtabError into one short actionable sentence.
+
+    Pinchtab returns errors like:
+        HTTP 500: {"code":"action_failed","error":"action click: scroll
+        into view: Node is detached from document (-32000)","retryable":true}
+
+    The raw form leaks JSON + HTTP framing into the LLM's tool_result and
+    makes Claude focus on parsing rather than recovering. This returns
+    something like:
+        click failed: the element was removed from the DOM between snap
+        and action (page mutated). The next snap will reflect the new
+        state — pick a ref from that snap, not the previous one.
+    """
+    body = getattr(exc, "body", "") or ""
+    raw_msg = ""
+    code = ""
+    try:
+        parsed = json.loads(body) if body else {}
+        if isinstance(parsed, dict):
+            raw_msg = str(parsed.get("error") or parsed.get("message") or "")
+            code = str(parsed.get("code") or "")
+    except (json.JSONDecodeError, ValueError):
+        raw_msg = body[:200]
+    if not raw_msg:
+        raw_msg = str(exc)[:200]
+    # Match against both `code` and `error` so e.g. code=navigation_changed
+    # with error="unexpected page navigation" maps to the right hint.
+    haystack = (code + " " + raw_msg).lower()
+    for fragment, hint in _PINCHTAB_ERROR_HINTS:
+        if fragment.lower() in haystack:
+            return f"action failed: {hint} (pinchtab: {raw_msg.strip()[:160]})"
+    # Unknown error code — strip JSON noise but keep the message visible.
+    cleaned = raw_msg.strip().strip('"')[:200]
+    return f"action failed: {cleaned}"
 
 
 def _detect_tool_loop(

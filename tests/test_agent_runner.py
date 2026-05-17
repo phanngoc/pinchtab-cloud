@@ -19,8 +19,10 @@ from backend.agent_runner import (
     AgentResult,
     _execute_tool,
     _extract_refs,
+    _humanize_pinchtab_error,
     run_task,
 )
+from backend.pinchtab_client import PinchtabError
 from backend.db import Base
 from backend.models import Profile, Task, TaskEvent, TaskStatus, User
 
@@ -437,6 +439,84 @@ def test_extract_refs_handles_real_snap_format():
     )
     assert _extract_refs(snap) == {"e2", "e5", "e42"}
     assert _extract_refs("") == set()
+
+
+def test_humanize_pinchtab_error_detached_node():
+    """Real Viblo failure: 'Node is detached from document' should map to
+    an actionable hint about DOM mutation, not the raw JSON."""
+    exc = PinchtabError(
+        500,
+        '{"code":"action_failed","error":"action click: scroll into view: '
+        'Node is detached from document (-32000)","retryable":true}',
+        "POST /tabs/X/action",
+    )
+    msg = _humanize_pinchtab_error(exc)
+    assert "DOM" in msg or "removed" in msg
+    assert "next snap" in msg.lower()
+    # Original JSON noise should NOT be in the actionable part.
+    assert '"code":"action_failed"' not in msg
+
+
+def test_humanize_pinchtab_error_navigation_changed():
+    exc = PinchtabError(
+        409,
+        '{"code":"navigation_changed","error":"unexpected page navigation: '
+        'https://a.com -> https://b.com"}',
+        "POST /tabs/X/action",
+    )
+    msg = _humanize_pinchtab_error(exc)
+    assert "navigated" in msg.lower()
+    assert "stale" in msg.lower()
+
+
+def test_humanize_pinchtab_error_not_focusable():
+    exc = PinchtabError(
+        500,
+        '{"code":"action_failed","error":"action fill: Element is not focusable (-32000)"}',
+        "POST /tabs/X/action",
+    )
+    msg = _humanize_pinchtab_error(exc)
+    assert "focusable" in msg.lower()
+    assert "find_element" in msg.lower()
+
+
+def test_humanize_pinchtab_error_unknown_falls_back_cleanly():
+    """An unrecognized error still gets sanitized — no raw JSON braces."""
+    exc = PinchtabError(
+        500,
+        '{"code":"weird_thing","error":"something broke deeply"}',
+        "POST /tabs/X/action",
+    )
+    msg = _humanize_pinchtab_error(exc)
+    assert "action failed" in msg
+    assert "something broke deeply" in msg
+    assert "{" not in msg  # no JSON noise
+
+
+@pytest.mark.asyncio
+async def test_pinchtab_error_translated_in_tool_result():
+    """End-to-end: a click that raises PinchtabError returns a humanized
+    error string to the agent, not the raw HTTP body."""
+    class FlakyClient:
+        async def click(self, tab_id, ref):
+            raise PinchtabError(
+                500,
+                '{"code":"action_failed","error":"action click: Node is detached from document"}',
+                "POST /tabs/X/action",
+            )
+
+    res, _, _, _ = await _execute_tool(
+        FlakyClient(),  # type: ignore[arg-type]
+        "tab-x",
+        "click",
+        {"ref": "e5"},
+        None,  # type: ignore[arg-type]
+        current_refs={"e5"},
+    )
+    assert "action failed:" in res
+    assert "DOM" in res or "removed" in res
+    assert "HTTP 500" not in res
+    assert '"code"' not in res
 
 
 @pytest.mark.asyncio
