@@ -16,8 +16,11 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.auth import router as auth_router
 from backend.billing import router as billing_router
@@ -42,7 +45,10 @@ async def lifespan(app: FastAPI):
     # Pinchtab client lives for the app's lifetime; reused across requests.
     # Tests override via `app.state.pinchtab = FakeClient()` before requests.
     if not hasattr(app.state, "pinchtab"):
-        app.state.pinchtab = PinchtabClient(base_url=settings.worker_base_url)
+        app.state.pinchtab = PinchtabClient(
+            base_url=settings.worker_base_url,
+            token=settings.pinchtab_token or None,
+        )
 
     try:
         yield
@@ -60,13 +66,38 @@ app = FastAPI(
 )
 
 
+def _is_rate_limit_exempt(method: str, path: str) -> bool:
+    """Idempotent read endpoints the dashboard polls at high frequency.
+    Exempting them prevents the dashboard from rate-limiting itself.
+
+    Anything that mutates state (POST/DELETE/PATCH) or fires LLM/pinchtab
+    work goes through the normal limit.
+    """
+    if method != "GET":
+        return False
+    if path in ("/health", "/metrics", "/profiles") or path == "/":
+        return True
+    if path.startswith("/static/"):
+        return True
+    if path.startswith("/tasks/"):
+        # /tasks (list), /tasks/{id}, /tasks/{id}/stream, /tasks/{id}/steps,
+        # /tasks/{id}/steps/{n}/screenshot|snap, /tasks/{id}/awaiting-input
+        return True
+    if path == "/tasks":
+        return True
+    return False
+
+
 @app.middleware("http")
 async def per_user_rate_limit(request: Request, call_next):
-    """Apply per-user rate limit only on authenticated endpoints. Auth and
-    webhook routes bypass."""
+    """Apply per-user rate limit only on authenticated state-changing
+    endpoints. Read-only / polling endpoints are exempt — they're idempotent
+    and the dashboard polls them by design."""
+    if _is_rate_limit_exempt(request.method, request.url.path):
+        return await call_next(request)
+
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
-        # Cheap-ish: parse user id from cookie token without DB round-trip.
         try:
             from backend.security import decode_user_session_cookie
 
@@ -78,11 +109,9 @@ async def per_user_rate_limit(request: Request, call_next):
                     content={"detail": "rate_limited"},
                 )
         except HTTPException:
-            # Invalid token is handled by the actual endpoint dependency.
             pass
 
-    response = await call_next(request)
-    return response
+    return await call_next(request)
 
 
 @app.get("/health")
@@ -114,3 +143,16 @@ app.include_router(auth_router)
 app.include_router(tasks_router)
 app.include_router(profiles_router)
 app.include_router(billing_router)
+
+
+# Dashboard — single-file HTML served at /. Vanilla JS, no build step.
+_STATIC_DIR = Path(__file__).parent / "static"
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+
+    @app.get("/", include_in_schema=False)
+    async def dashboard_root():
+        index = _STATIC_DIR / "index.html"
+        if not index.exists():
+            raise HTTPException(status_code=404, detail="dashboard_missing")
+        return FileResponse(str(index), media_type="text/html")

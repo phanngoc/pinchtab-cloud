@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pinchtab Cloud SG</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --fg: #e7ebf2;
+      --muted: #8a93a6;
+      --border: #232733;
+      --accent: #ffd166;
+      --ok: #6dd58b;
+      --warn: #ffb74d;
+      --err: #ef6a6a;
+      --bg-card: #161a22;
+      --bg-input: #1c2230;
+      --mono: ui-monospace, "JetBrains Mono", Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      background: var(--bg); color: var(--fg);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    h1 { font-size: 18px; margin: 0 0 16px; letter-spacing: 0.2px; }
+    h1 .pill { font-size: 11px; padding: 2px 8px; border-radius: 99px; background: var(--bg-card); color: var(--muted); margin-left: 8px; vertical-align: 2px;}
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .card h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); letter-spacing: 0.5px; text-transform: uppercase; }
+    label { display: block; font-size: 12px; color: var(--muted); margin: 8px 0 4px; }
+    input, textarea, button {
+      font: inherit; color: var(--fg);
+      background: var(--bg-input); border: 1px solid var(--border);
+      border-radius: 6px; padding: 8px 10px; width: 100%;
+    }
+    textarea { font-family: var(--mono); font-size: 13px; resize: vertical; min-height: 64px; }
+    button {
+      cursor: pointer; background: var(--accent); color: #0b0b0e;
+      font-weight: 600; border: none; transition: 0.1s;
+    }
+    button:hover { filter: brightness(1.05); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.ghost { background: var(--bg-input); color: var(--fg); }
+    .row { display: flex; gap: 8px; }
+    .row > * { flex: 1; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .mono { font-family: var(--mono); font-size: 12px; }
+    .pill {
+      display: inline-block; padding: 2px 8px; border-radius: 99px;
+      font-size: 11px; font-family: var(--mono);
+      background: var(--bg-input); color: var(--muted);
+    }
+    .pill.ok { color: var(--ok); }
+    .pill.warn { color: var(--warn); }
+    .pill.err { color: var(--err); }
+    .pill.running { color: var(--accent); }
+    .log {
+      font-family: var(--mono); font-size: 12px;
+      background: #0b0e14; border: 1px solid var(--border);
+      border-radius: 6px; padding: 10px; min-height: 200px;
+      max-height: 480px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .log .event { padding: 2px 0; border-bottom: 1px dashed #1c2230; }
+    .log .event:last-child { border-bottom: none; }
+    .ev-time { color: var(--muted); margin-right: 6px; }
+    .ev-type { color: var(--accent); margin-right: 6px; font-weight: 600; }
+    .ev-started { color: var(--ok); }
+    .ev-step { color: var(--muted); }
+    .ev-tool_call { color: #6ab4ff; }
+    .ev-tool_result { color: #8a93a6; }
+    .ev-terminal { color: var(--ok); font-weight: 600; }
+    .ev-keepalive { color: #444; }
+    .ev-open { color: var(--muted); }
+    .hidden { display: none; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+    .help { font-size: 11px; color: var(--muted); margin-top: 4px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .task-row { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .task-row:hover { background: rgba(255,255,255,0.02); }
+    .task-row:last-child { border-bottom: none; }
+    .task-row .id { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+    .strip { display: flex; gap: 6px; overflow-x: auto; padding: 8px 0; }
+    .strip .thumb { flex: 0 0 160px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; cursor: pointer; background: #000; position: relative; }
+    .strip .thumb img { width: 100%; height: 100px; object-fit: cover; display: block; }
+    .strip .thumb .label { position: absolute; bottom: 0; left: 0; right: 0; background: rgba(0,0,0,0.7); color: var(--fg); font-family: var(--mono); font-size: 10px; padding: 2px 4px; }
+    .strip .thumb.empty { display: flex; align-items: center; justify-content: center; height: 100px; color: var(--muted); font-size: 11px; }
+    .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none; align-items: center; justify-content: center; z-index: 100; }
+    .modal.active { display: flex; }
+    .modal img { max-width: 92vw; max-height: 92vh; box-shadow: 0 8px 32px rgba(0,0,0,0.8); }
+    .modal .x { position: absolute; top: 16px; right: 24px; color: #fff; font-size: 28px; cursor: pointer; }
+    .profile-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border); }
+    .profile-row:last-child { border-bottom: none; }
+    .profile-info { font-family: var(--mono); font-size: 12px; }
+    .profile-info .name { color: var(--fg); }
+    .profile-info .meta { color: var(--muted); font-size: 11px; }
+    .danger { background: var(--err); color: #fff; }
+    .danger:hover { filter: brightness(1.1); }
+    .input-card { background: #1a2333; border: 1px solid var(--accent); border-radius: 6px; padding: 14px; margin: 10px 0; }
+    .input-card h3 { margin: 0 0 8px; font-size: 13px; color: var(--accent); text-transform: uppercase; letter-spacing: 0.5px; }
+    .input-card .prompt { color: var(--fg); margin-bottom: 10px; font-size: 13px; }
+    .input-card .form-row { margin-bottom: 8px; }
+    .input-card label { font-size: 11px; color: var(--muted); display: block; margin-bottom: 3px; }
+    .input-card input { font-size: 13px; }
+    .input-card .submit-row { display: flex; gap: 8px; margin-top: 8px; }
+    .input-card .submit-row button { flex: 0 0 auto; padding: 6px 14px; }
+    .input-card .submit-row .send { background: var(--accent); color: #0b0b0e; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>🤏 Pinchtab Cloud SG <span class="pill">dev</span></h1>
+
+  <!-- AUTH -->
+  <section class="card" id="card-auth">
+    <h2>1. Đăng nhập</h2>
+    <p class="muted">Magic link gửi qua email. Trong dev mode link in ra ngay trên dashboard (không cần inbox).</p>
+    <div class="row">
+      <input id="auth-email" placeholder="email@example.com" />
+      <button onclick="requestLink()" style="flex: 0 0 140px">Gửi link</button>
+    </div>
+    <div id="auth-link-out" class="hidden" style="margin-top: 8px">
+      <label>Dev link (click hoặc Verify token bên dưới):</label>
+      <div class="mono"><a id="auth-link-anchor" href="#"></a></div>
+    </div>
+    <label style="margin-top: 12px">Token (auto fill từ link):</label>
+    <div class="row">
+      <input id="auth-token" placeholder="paste token" />
+      <button onclick="verifyToken()" style="flex: 0 0 140px">Verify</button>
+    </div>
+    <div id="auth-status" class="help"></div>
+  </section>
+
+  <!-- NEW TASK (hidden until auth) -->
+  <section class="card hidden" id="card-task">
+    <h2>2. New task</h2>
+    <label>Mô tả công việc (tự nhiên ngôn ngữ)</label>
+    <textarea id="task-desc" placeholder="Vd: tìm 5 tiêu đề mới nhất trên news.example.com và liệt kê title + tác giả"></textarea>
+    <div class="grid2">
+      <div>
+        <label>Start URL (optional)</label>
+        <input id="task-url" placeholder="https://example.com" />
+      </div>
+      <div>
+        <label>Claude API key (optional)</label>
+        <input id="task-key" type="password" placeholder="sk-ant-api03-… (bỏ trống = dùng claude CLI subscription)" />
+        <div class="help">
+          Điền key → dùng API key đó (BYO, ai cũng được).<br>
+          Bỏ trống → dùng claude CLI subscription của operator (chỉ operator được).<br>
+          Key chỉ tồn tại trong RAM khi task chạy. Không lưu đĩa, không log.
+        </div>
+      </div>
+    </div>
+    <div style="margin-top: 12px" class="row">
+      <button onclick="runTask()" id="btn-run">▶ Run task</button>
+      <button onclick="logout()" class="ghost" style="flex: 0 0 100px">Logout</button>
+    </div>
+  </section>
+
+  <!-- LIVE STREAM (hidden until task runs) -->
+  <section class="card hidden" id="card-stream">
+    <h2>3. Live progress <span id="task-status" class="pill"></span></h2>
+    <div class="muted mono" id="task-meta"></div>
+    <div class="log" id="event-log"></div>
+    <div style="margin-top: 10px" class="row">
+      <button onclick="haltTask()" id="btn-halt" class="ghost" style="flex: 0 0 140px" disabled>Halt</button>
+      <button onclick="resetView()" class="ghost" style="flex: 0 0 140px">Tasks mới</button>
+    </div>
+    <div id="task-summary" class="muted" style="margin-top: 10px"></div>
+    <!-- Human-in-the-loop input request form. Rendered when the agent calls request_user_input. -->
+    <div id="input-request" class="input-card hidden"></div>
+    <div style="margin-top: 14px">
+      <div class="muted" style="margin-bottom: 4px">Artifacts (screenshots per step) — click để zoom:</div>
+      <div id="step-strip" class="strip"></div>
+    </div>
+  </section>
+
+  <!-- HISTORY -->
+  <section class="card hidden" id="card-history">
+    <h2>4. Task history</h2>
+    <div id="history-list" class="mono"></div>
+    <button class="ghost" style="margin-top: 8px" onclick="refreshHistory()">Refresh</button>
+  </section>
+
+  <!-- PROFILES (Task 2) -->
+  <section class="card hidden" id="card-profiles">
+    <h2>5. Profile của bạn</h2>
+    <div class="muted" style="margin-bottom: 8px">
+      Profile = state của Chromium (cookies, logins, extensions, localStorage) trên pinchtab daemon.
+      Một profile / user. Tự tạo khi bạn submit task đầu tiên. Reset = wipe cookies + tạo profile mới. Delete = xóa hẳn.
+    </div>
+    <div id="profile-list"></div>
+    <button class="ghost" style="margin-top: 8px" onclick="refreshProfiles()">Refresh</button>
+  </section>
+
+</div>
+
+<!-- Screenshot zoom modal -->
+<div class="modal" id="img-modal" onclick="closeModal()">
+  <span class="x">×</span>
+  <img id="modal-img" alt="step screenshot" />
+</div>
+
+<script>
+const LS = window.localStorage;
+let currentBearer = LS.getItem('bearer') || null;
+let currentEmail = LS.getItem('email') || null;
+let currentTaskId = null;
+let currentStreamAbort = null;
+
+function $(id){ return document.getElementById(id); }
+function show(id){ $(id).classList.remove('hidden'); }
+function hide(id){ $(id).classList.add('hidden'); }
+function pad(n){ return String(n).padStart(2,'0'); }
+function ts(){ const d=new Date(); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+
+async function requestLink(){
+  const email = $('auth-email').value.trim();
+  if (!email) return;
+  const r = await fetch('/auth/request-link', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({email})
+  });
+  const j = await r.json();
+  if (j.dev_link){
+    $('auth-link-out').classList.remove('hidden');
+    const a = $('auth-link-anchor');
+    a.textContent = j.dev_link;
+    a.href = j.dev_link;
+    const url = new URL(j.dev_link);
+    const token = url.searchParams.get('token');
+    if (token) $('auth-token').value = token;
+    $('auth-status').textContent = 'Dev link generated. Click hoặc Verify bằng token đã auto-fill.';
+  } else {
+    $('auth-status').textContent = 'Sent (production mode — kiểm tra email).';
+  }
+}
+
+async function verifyToken(){
+  const token = $('auth-token').value.trim();
+  if (!token) return;
+  const r = await fetch('/auth/verify', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({token})
+  });
+  if (!r.ok){
+    $('auth-status').textContent = `Verify failed: ${r.status}`;
+    return;
+  }
+  const j = await r.json();
+  currentBearer = j.bearer;
+  currentEmail = j.email;
+  LS.setItem('bearer', currentBearer);
+  LS.setItem('email', currentEmail);
+  enterLoggedIn();
+}
+
+function enterLoggedIn(){
+  hide('card-auth');
+  show('card-task');
+  show('card-history');
+  show('card-profiles');
+  $('task-meta').textContent = `Logged in as ${currentEmail}`;
+  refreshHistory();
+  refreshProfiles();
+}
+
+function logout(){
+  LS.removeItem('bearer');
+  LS.removeItem('email');
+  currentBearer = currentEmail = null;
+  hide('card-task'); hide('card-history'); hide('card-stream'); hide('card-profiles');
+  show('card-auth');
+}
+
+// ---- Screenshots / step artifacts ----
+//
+// Incremental load: keep a Set of step numbers we've already loaded a blob
+// URL for. On each refresh we GET /steps to discover new step numbers, then
+// fetch ONLY the screenshots not yet in our set. Prevents the polling loop
+// from re-fetching every screenshot every cycle (which previously self-
+// triggered our own rate limit).
+
+let loadedStepIds = new Set();
+let currentArtifactTask = null;  // resets on showStream
+
+function resetArtifactState(taskId){
+  // Release prior blob URLs to free memory.
+  document.querySelectorAll('#step-strip img').forEach(img => {
+    if (img.src.startsWith('blob:')) URL.revokeObjectURL(img.src);
+  });
+  loadedStepIds = new Set();
+  currentArtifactTask = taskId;
+}
+
+async function refreshStepStrip(taskId){
+  if (!taskId) return;
+  const strip = $('step-strip');
+  // Lazy-init placeholder only the first time
+  if (loadedStepIds.size === 0 && !strip.querySelector('.thumb:not(.empty)')) {
+    if (strip.children.length === 0) {
+      strip.innerHTML = '<div class="thumb empty">Waiting for first screenshot…</div>';
+    }
+  }
+  let steps;
+  try {
+    const r = await fetch(`/tasks/${taskId}/steps`, {
+      headers: {'authorization': `Bearer ${currentBearer}`}
+    });
+    if (!r.ok) return;
+    steps = await r.json();
+  } catch { return; }
+
+  if (!Array.isArray(steps) || steps.length === 0) return;
+
+  // Clear empty placeholder once real steps exist.
+  const empty = strip.querySelector('.thumb.empty');
+  if (empty) empty.remove();
+
+  // For each step we haven't loaded yet, fetch its screenshot once.
+  for (const s of steps) {
+    if (loadedStepIds.has(s.step) || !s.screenshot_url) continue;
+    // Mark as in-flight immediately so concurrent refresh calls don't dupe.
+    loadedStepIds.add(s.step);
+    try {
+      const ir = await fetch(s.screenshot_url, {
+        headers: {'authorization': `Bearer ${currentBearer}`}
+      });
+      if (!ir.ok) {
+        // Roll back so we'll retry on next refresh.
+        loadedStepIds.delete(s.step);
+        continue;
+      }
+      const blob = await ir.blob();
+      const url = URL.createObjectURL(blob);
+      const div = document.createElement('div');
+      div.className = 'thumb';
+      div.dataset.full = url;
+      div.onclick = () => openModal(url);
+      div.innerHTML = `<img src="${url}" alt="step ${s.step}"><div class="label">step ${s.step}</div>`;
+      strip.appendChild(div);
+    } catch {
+      loadedStepIds.delete(s.step);
+    }
+  }
+}
+
+function openModal(url){
+  if (!url) return;
+  $('modal-img').src = url;
+  $('img-modal').classList.add('active');
+}
+function closeModal(){ $('img-modal').classList.remove('active'); }
+
+// ---- Profiles ----
+
+async function refreshProfiles(){
+  if (!currentBearer) return;
+  const r = await fetch('/profiles', {headers: {'authorization': `Bearer ${currentBearer}`}});
+  if (!r.ok) return;
+  const profiles = await r.json();
+  const el = $('profile-list');
+  if (profiles.length === 0) {
+    el.innerHTML = '<div class="muted">Chưa có profile. Sẽ tự tạo khi bạn submit task đầu tiên.</div>';
+    return;
+  }
+  el.innerHTML = profiles.map(p => `
+    <div class="profile-row">
+      <div class="profile-info">
+        <div class="name">${escapeHtml(p.pinchtab_profile_name)}</div>
+        <div class="meta">
+          id=${escapeHtml(p.id.slice(0, 12))} ·
+          ${p.instance_live ? '<span class="pill running">instance live</span>' : '<span class="pill">idle</span>'} ·
+          ${p.last_used_at ? 'last used ' + new Date(p.last_used_at).toLocaleString() : 'never used'}
+        </div>
+      </div>
+      <div>
+        <button class="ghost" style="padding: 4px 10px; margin-right: 4px" onclick="resetProfile('${p.id}')">Reset</button>
+        <button class="danger" style="padding: 4px 10px" onclick="deleteProfile('${p.id}')">Delete</button>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function resetProfile(id){
+  if (!confirm('Reset profile? Logs out của tất cả site, mất cookies. Tạo profile pinchtab mới.')) return;
+  const r = await fetch(`/profiles/${id}/reset`, {
+    method: 'POST', headers: {'authorization': `Bearer ${currentBearer}`}
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(()=>({}));
+    alert(`Reset failed: ${r.status} ${j.detail || ''}`);
+    return;
+  }
+  refreshProfiles();
+}
+
+async function deleteProfile(id){
+  if (!confirm('Xóa profile? Không thể undo. Task history vẫn còn.')) return;
+  const r = await fetch(`/profiles/${id}`, {
+    method: 'DELETE', headers: {'authorization': `Bearer ${currentBearer}`}
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(()=>({}));
+    alert(`Delete failed: ${r.status} ${j.detail || ''}`);
+    return;
+  }
+  refreshProfiles();
+}
+
+async function runTask(){
+  const desc = $('task-desc').value.trim();
+  const url = $('task-url').value.trim();
+  const key = $('task-key').value.trim();
+  if (desc.length < 10) { alert('Mô tả ít nhất 10 ký tự'); return; }
+  // Empty key is allowed (operator-only fallback to claude CLI subscription).
+  if (key.length > 0 && key.length < 10) { alert('Nếu điền key, phải ít nhất 10 ký tự (hoặc bỏ trống để dùng CLI)'); return; }
+  const body = { task_description: desc };
+  if (key) body.anthropic_api_key = key;
+  if (url) body.start_url = url;
+
+  $('btn-run').disabled = true;
+  const r = await fetch('/tasks', {
+    method: 'POST',
+    headers: {'content-type': 'application/json', 'authorization': `Bearer ${currentBearer}`},
+    body: JSON.stringify(body)
+  });
+  $('btn-run').disabled = false;
+  if (!r.ok){
+    const err = await r.text();
+    alert(`Submit failed: ${r.status}\n${err}`);
+    return;
+  }
+  const task = await r.json();
+  currentTaskId = task.id;
+  // Clear key from input so it doesn't sit there.
+  $('task-key').value = '';
+  showStream(task);
+}
+
+let currentPollHandle = null;
+
+function showStream(task){
+  show('card-stream');
+  $('task-status').textContent = task.status;
+  $('task-status').className = 'pill ' + statusClass(task.status);
+  $('task-meta').innerHTML = `task=<span style="color:#fff">${task.id}</span> · profile=<span style="color:#fff">${task.profile_id}</span>`;
+  $('event-log').innerHTML = '';
+  $('task-summary').textContent = '';
+  $('step-strip').innerHTML = '';
+  resetArtifactState(task.id);
+  hideInputForm();
+  $('btn-halt').disabled = false;
+  appendEvent({type:'open', message: 'connecting…'});
+  streamEvents(task.id);
+  pollTaskState(task.id);
+  pollArtifacts(task.id);
+  checkAwaitingInput(task.id);
+  refreshHistory();
+}
+
+let currentArtifactPoll = null;
+function pollArtifacts(taskId){
+  if (currentArtifactPoll) clearInterval(currentArtifactPoll);
+  // Initial pull, then a SPARSE interval as fallback only. The strip is
+  // primarily refreshed event-driven via the SSE `step` event (see
+  // appendEvent → 'step' branch). Polling kicks in if SSE drops events.
+  refreshStepStrip(taskId);
+  currentArtifactPoll = setInterval(() => refreshStepStrip(taskId), 12000);
+}
+function stopArtifactPoll(){
+  if (currentArtifactPoll) { clearInterval(currentArtifactPoll); currentArtifactPoll = null; }
+}
+
+// Belt-and-suspenders alongside the SSE stream: poll task state every 5s.
+// Useful when the runner errors before publishing any events (e.g. pinchtab
+// down, profile create failed) — the SSE stream sees only keepalive but
+// this polling will surface the errored state and the error_message in
+// <6s. SSE is the primary live channel; this is just safety net.
+function pollTaskState(taskId){
+  if (currentPollHandle) clearInterval(currentPollHandle);
+  let stopped = false;
+  currentPollHandle = setInterval(async () => {
+    if (stopped) return;
+    try {
+      const r = await fetch(`/tasks/${taskId}`, {
+        headers: {'authorization': `Bearer ${currentBearer}`}
+      });
+      if (!r.ok) return;
+      const t = await r.json();
+      $('task-status').textContent = t.status;
+      $('task-status').className = 'pill ' + statusClass(t.status);
+      if (t.status === 'done' || t.status === 'halted' || t.status === 'errored') {
+        if (t.final_summary) {
+          $('task-summary').innerHTML = `<b>Summary:</b> ${escapeHtml(t.final_summary)}`;
+        } else if (t.error_message) {
+          $('task-summary').innerHTML = `<b>Error:</b> <span style="color:var(--err)">${escapeHtml(t.error_message)}</span>`;
+          // Mirror the error into the event log so the user sees it inline.
+          if (!document.querySelector('.event[data-from-poll]')){
+            const div = document.createElement('div');
+            div.className = 'event';
+            div.dataset.fromPoll = '1';
+            div.innerHTML = `<span class="ev-time">[${ts()}]</span><span class="ev-type" style="color:var(--err)">error</span><span style="color:var(--err)">${escapeHtml(t.error_message)}</span>`;
+            $('event-log').appendChild(div);
+            $('event-log').scrollTop = $('event-log').scrollHeight;
+          }
+        }
+        $('btn-halt').disabled = true;
+        stopped = true;
+        clearInterval(currentPollHandle);
+        currentPollHandle = null;
+        refreshHistory();
+      } else if (t.status === 'running' && !document.querySelector('.event[data-running-mark]')){
+        const div = document.createElement('div');
+        div.className = 'event';
+        div.dataset.runningMark = '1';
+        div.innerHTML = `<span class="ev-time">[${ts()}]</span><span class="ev-type ev-started">running</span>agent loop in flight…`;
+        $('event-log').appendChild(div);
+      }
+    } catch (e) {}
+  }, 5000);
+}
+
+function statusClass(s){
+  if (s === 'done') return 'ok';
+  if (s === 'halted') return 'warn';
+  if (s === 'errored') return 'err';
+  if (s === 'running') return 'running';
+  return '';
+}
+
+function escapeHtml(s){ return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function appendEvent(ev){
+  const log = $('event-log');
+  const line = document.createElement('div');
+  line.className = 'event';
+  const cls = 'ev-' + (ev.type || 'message');
+  let body = '';
+  switch(ev.type){
+    case 'started':
+      body = `<span class="ev-started">started</span> tab=<b>${escapeHtml(ev.tab_id)}</b> instance=<b>${escapeHtml(ev.instance_id)}</b> rules=<b>${ev.denylist_rules}</b>`;
+      break;
+    case 'step':
+      body = `<span class="ev-step">step ${ev.step}</span>`;
+      // Event-driven artifact refresh: each new step likely has a new
+      // screenshot on disk. Give the runner ~600ms to write the file,
+      // then refresh. Far cheaper than polling on a timer.
+      if (currentTaskId) setTimeout(() => refreshStepStrip(currentTaskId), 600);
+      break;
+    case 'llm_call':
+      body = `<span style="color:#6ab4ff">🧠 LLM thinking…</span> <span class="muted">(${ev.prompt_messages} msgs)</span>`;
+      break;
+    case 'llm_done':
+      const cls = ev.error ? 'var(--err)' : 'var(--ok)';
+      const tag = ev.error ? `error ${escapeHtml(ev.error)}` : 'response received';
+      body = `<span style="color:${cls}">🧠 ${tag}</span> <span class="muted">(${ev.elapsed_seconds}s)</span>`;
+      break;
+    case 'tool_call':
+      body = `<span class="ev-tool_call">▶ ${escapeHtml(ev.name)}(${escapeHtml(JSON.stringify(ev.params))})</span>`;
+      break;
+    case 'tool_result':
+      body = `<span class="ev-tool_result">← ${escapeHtml(ev.name)}: ${escapeHtml(ev.result)}</span>`;
+      break;
+    case 'terminal':
+      body = `<span class="ev-terminal">${ev.status === 'done' ? '✓' : (ev.status === 'halted' ? '⏸' : '✗')} terminal: ${escapeHtml(ev.status)} · ${escapeHtml(ev.summary || ev.error || '')} (${ev.steps} steps · ${(ev.minutes ?? 0).toFixed(2)}m)</span>`;
+      onTerminal(ev);
+      break;
+    case 'awaiting_input':
+      body = `<span style="color:var(--accent);font-weight:600">▸ awaiting_input</span> "${escapeHtml(ev.prompt)}" (${(ev.fields || []).map(f=>f.name).join(', ')})`;
+      renderInputForm(ev);
+      break;
+    case 'input_received':
+      body = `<span class="ev-tool_result">← user provided: [${(ev.field_names||[]).join(', ')}]</span>`;
+      hideInputForm();
+      break;
+    case 'input_timeout':
+      body = `<span style="color:var(--err)">⏱ input timeout (${ev.timeout_seconds}s) — task halted</span>`;
+      hideInputForm();
+      break;
+    case 'open':
+      body = `<span class="ev-open">${escapeHtml(ev.task_id || ev.message)}</span>`;
+      break;
+    case 'keepalive':
+      body = `<span class="ev-keepalive">·</span>`;
+      break;
+    case 'end':
+      body = `<span class="ev-open">stream closed</span>`;
+      break;
+    default:
+      body = escapeHtml(JSON.stringify(ev));
+  }
+  line.innerHTML = `<span class="ev-time">[${ts()}]</span><span class="ev-type">${ev.type || 'msg'}</span>${body}`;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+// ---- Human-in-the-loop input form ----
+
+function renderInputForm(ev){
+  const box = $('input-request');
+  const fields = (ev.fields || []).map(f => `
+    <div class="form-row">
+      <label>${escapeHtml(f.label || f.name)} <span class="muted">(${escapeHtml(f.type || 'text')})</span></label>
+      <input id="ui-fld-${escapeHtml(f.name)}" type="${escapeHtml(f.type || 'text')}" autocomplete="off" />
+    </div>
+  `).join('');
+  box.innerHTML = `
+    <h3>🙋 Agent cần input của bạn</h3>
+    <div class="prompt">${escapeHtml(ev.prompt || 'Provide the following:')}</div>
+    ${fields}
+    <div class="submit-row">
+      <button class="send" onclick="submitInput()">Gửi cho agent</button>
+      <button class="ghost" onclick="cancelInput()">Hủy (halt task)</button>
+    </div>
+    <div class="muted" style="font-size: 11px; margin-top: 6px">
+      ⚠ Values pass through Claude's message history. Đừng dùng cho production credential. Dùng tài khoản test/demo only.
+    </div>
+  `;
+  box.classList.remove('hidden');
+  box.dataset.fields = JSON.stringify(ev.fields || []);
+  // Focus first field for keyboard-flow.
+  setTimeout(() => {
+    const first = box.querySelector('input');
+    if (first) first.focus();
+  }, 50);
+}
+
+function hideInputForm(){
+  const box = $('input-request');
+  box.classList.add('hidden');
+  box.innerHTML = '';
+}
+
+async function submitInput(){
+  if (!currentTaskId) return;
+  const box = $('input-request');
+  const fields = JSON.parse(box.dataset.fields || '[]');
+  const values = {};
+  for (const f of fields){
+    const el = document.getElementById('ui-fld-' + f.name);
+    if (el) values[f.name] = el.value;
+  }
+  const r = await fetch(`/tasks/${currentTaskId}/provide-input`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', 'authorization': `Bearer ${currentBearer}`},
+    body: JSON.stringify(values)
+  });
+  if (!r.ok){
+    const j = await r.json().catch(()=>({}));
+    alert(`Gửi input thất bại: ${r.status} ${j.detail || ''}`);
+    return;
+  }
+  // Form stays visible until input_received event arrives; in the meantime
+  // grey it out so user knows it's submitted.
+  box.style.opacity = '0.4';
+  box.querySelectorAll('input,button').forEach(el => el.disabled = true);
+}
+
+async function cancelInput(){
+  if (!currentTaskId) return;
+  // Trigger halt → registry.cancel happens implicitly when runner sees CancelledError.
+  await fetch(`/tasks/${currentTaskId}/halt`, {
+    method: 'POST', headers: {'authorization': `Bearer ${currentBearer}`}
+  });
+  hideInputForm();
+}
+
+// On opening any task (live or historical), check if there's pending input.
+async function checkAwaitingInput(taskId){
+  try {
+    const r = await fetch(`/tasks/${taskId}/awaiting-input`, {
+      headers: {'authorization': `Bearer ${currentBearer}`}
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data && data.prompt) {
+      renderInputForm(data);
+    }
+  } catch {}
+}
+
+function onTerminal(ev){
+  $('task-status').textContent = ev.status;
+  $('task-status').className = 'pill ' + statusClass(ev.status);
+  $('btn-halt').disabled = true;
+  if (ev.summary) {
+    $('task-summary').innerHTML = `<b>Summary:</b> ${escapeHtml(ev.summary)}`;
+  } else if (ev.error) {
+    $('task-summary').innerHTML = `<b>Error:</b> <span style="color:var(--err)">${escapeHtml(ev.error)}</span>`;
+  }
+  // One final artifact refresh; then stop polling.
+  if (currentTaskId) refreshStepStrip(currentTaskId);
+  stopArtifactPoll();
+  refreshHistory();
+  refreshProfiles();
+}
+
+async function streamEvents(taskId){
+  // We use fetch streaming so we can send Authorization header (EventSource
+  // doesn't support custom headers).
+  if (currentStreamAbort) currentStreamAbort.abort();
+  const ctrl = new AbortController();
+  currentStreamAbort = ctrl;
+  try {
+    const res = await fetch(`/tasks/${taskId}/stream`, {
+      headers: {'authorization': `Bearer ${currentBearer}`},
+      signal: ctrl.signal
+    });
+    if (!res.ok) {
+      appendEvent({type:'error', message: `HTTP ${res.status}`});
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) { appendEvent({type:'end'}); return; }
+      buffer += decoder.decode(value, {stream: true});
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) >= 0) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        const ev = {};
+        for (const line of block.split('\n')) {
+          if (line.startsWith('event: ')) ev._evt = line.slice(7).trim();
+          else if (line.startsWith('event:')) ev._evt = line.slice(6).trim();
+          else if (line.startsWith('data: ')) ev._data = line.slice(6);
+          else if (line.startsWith('data:')) ev._data = line.slice(5);
+        }
+        let parsed = {};
+        try { parsed = JSON.parse(ev._data || '{}'); } catch {}
+        if (!parsed.type) parsed.type = ev._evt;
+        appendEvent(parsed);
+        if (parsed.type === 'end') return;
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') appendEvent({type:'error', message: String(e)});
+  }
+}
+
+async function haltTask(){
+  if (!currentTaskId) return;
+  const r = await fetch(`/tasks/${currentTaskId}/halt`, {
+    method: 'POST',
+    headers: {'authorization': `Bearer ${currentBearer}`}
+  });
+  if (!r.ok) alert(`Halt failed: ${r.status}`);
+}
+
+function resetView(){
+  hide('card-stream');
+  if (currentStreamAbort) { currentStreamAbort.abort(); currentStreamAbort = null; }
+  if (currentPollHandle) { clearInterval(currentPollHandle); currentPollHandle = null; }
+  stopArtifactPoll();
+  currentTaskId = null;
+}
+
+async function refreshHistory(){
+  if (!currentBearer) return;
+  // Debounce: don't run more than once every 3 seconds.
+  const now = Date.now();
+  if (refreshHistory._lastRun && now - refreshHistory._lastRun < 3000) return;
+  refreshHistory._lastRun = now;
+  const r = await fetch('/tasks', {
+    headers: {'authorization': `Bearer ${currentBearer}`}
+  });
+  if (!r.ok) return;
+  const tasks = await r.json();
+  const el = $('history-list');
+  if (tasks.length === 0) { el.innerHTML = '<div class="muted">Chưa có task nào.</div>'; return; }
+  el.innerHTML = tasks.slice(0, 10).map(t => `
+    <div class="task-row" onclick="openHistoricalTask('${t.id}', '${t.profile_id}', '${t.status}')">
+      <div>
+        <span class="pill ${statusClass(t.status)}">${t.status}</span>
+        <span style="margin-left: 8px">${escapeHtml(t.task_description.slice(0, 80))}</span>
+      </div>
+      <div class="id">${escapeHtml(t.id.slice(0, 12))} · ${(t.minutes_consumed || 0).toFixed(2)}m</div>
+    </div>
+  `).join('');
+}
+
+async function openHistoricalTask(taskId, profileId, status){
+  // Click a history row → load that task's artifacts + summary, no live stream.
+  const r = await fetch(`/tasks/${taskId}`, {
+    headers: {'authorization': `Bearer ${currentBearer}`}
+  });
+  if (!r.ok) return;
+  const t = await r.json();
+  currentTaskId = taskId;
+  show('card-stream');
+  $('task-status').textContent = t.status;
+  $('task-status').className = 'pill ' + statusClass(t.status);
+  $('task-meta').innerHTML = `task=<span style="color:#fff">${t.id}</span> · profile=<span style="color:#fff">${t.profile_id}</span> · <span class="muted">historical view</span>`;
+  $('event-log').innerHTML = '<div class="muted">Live stream not available for historical tasks. Showing artifacts only.</div>';
+  $('btn-halt').disabled = true;
+  if (t.final_summary) {
+    $('task-summary').innerHTML = `<b>Summary:</b> ${escapeHtml(t.final_summary)}`;
+  } else if (t.error_message) {
+    $('task-summary').innerHTML = `<b>Error:</b> <span style="color:var(--err)">${escapeHtml(t.error_message)}</span>`;
+  } else {
+    $('task-summary').innerHTML = '';
+  }
+  refreshStepStrip(taskId);
+}
+
+// Bootstrap: URL fragment seed login for dev/share flows.
+// Format:  http://host/#bearer=...&email=...
+// Once consumed the fragment is stripped so the URL is shareable-safe again.
+(function consumeFragmentLogin(){
+  const h = window.location.hash;
+  if (!h || !h.startsWith('#')) return;
+  const params = new URLSearchParams(h.slice(1));
+  const b = params.get('bearer');
+  const e = params.get('email');
+  if (!b) return;
+  LS.setItem('bearer', b);
+  if (e) LS.setItem('email', e);
+  currentBearer = b;
+  currentEmail = e || currentEmail;
+  history.replaceState(null, '', '/');
+})();
+
+if (currentBearer) {
+  enterLoggedIn();
+}
+</script>
+</body>
+</html>
