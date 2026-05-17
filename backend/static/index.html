@@ -897,7 +897,9 @@ async function openHistoricalTask(taskId, profileId, status){
     if (hr.ok) {
       const events = await hr.json();
       if (events.length === 0) {
-        $('event-log').innerHTML = '<div class="muted">No persisted events for this run (older run before history was added, or never started).</div>';
+        // Legacy task (before TaskEvent persistence) — reconstruct a
+        // minimal timeline from disk artifacts + task row.
+        await reconstructLegacyTimeline(t);
       } else {
         for (const ev of events) {
           appendEvent({type: ev.kind, ...(ev.payload || {})});
@@ -910,6 +912,38 @@ async function openHistoricalTask(taskId, profileId, status){
     $('event-log').innerHTML = `<div class="muted">History fetch error: ${escapeHtml(String(e))}</div>`;
   }
   refreshStepStrip(taskId);
+}
+
+async function reconstructLegacyTimeline(t){
+  // For runs that predate TaskEvent persistence, synthesize a coarse
+  // event timeline from on-disk artifacts so the UI isn't blank.
+  appendEvent({type: 'open', message: '(legacy run — reconstructed from artifacts; no per-tool detail available)'});
+  if (t.start_url) {
+    appendEvent({type: 'open', message: `task: ${t.task_description || ''}`});
+    appendEvent({type: 'open', message: `start_url: ${t.start_url}`});
+  } else if (t.task_description) {
+    appendEvent({type: 'open', message: `task: ${t.task_description}`});
+  }
+  try {
+    const sr = await fetch(`/tasks/${t.id}/steps`, {
+      headers: {'authorization': `Bearer ${currentBearer}`}
+    });
+    if (sr.ok) {
+      const steps = await sr.json();
+      for (const s of steps) {
+        appendEvent({type: 'step', step: s.step});
+      }
+    }
+  } catch {}
+  // Synthetic terminal from the persisted task row.
+  appendEvent({
+    type: 'terminal',
+    status: t.status,
+    summary: t.final_summary || '',
+    error: t.error_message || '',
+    steps: 0,
+    minutes: t.minutes_consumed || 0,
+  });
 }
 
 // Hash-based detail routing: support deep-link / browser back/forward.
