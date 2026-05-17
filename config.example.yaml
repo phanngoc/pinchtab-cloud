@@ -1,0 +1,37 @@
+task:
+  description: |
+    Log into the admin dashboard, open the Orders page,
+    filter by status = "pending", and tell me how many rows are showing.
+  start_url: "https://your-app.example.com/admin"
+
+claude:
+  model: claude-sonnet-4-6
+  max_tokens: 2048
+
+agent:
+  max_steps: 30
+  step_delay_seconds: 1.5
+  snap_max_tokens: 4000
+  screenshot_quality: 60
+
+safety:
+  halt_on_text:
+    - "captcha"
+    - "verify you are human"
+    - "are you a robot"
+    - "enter the code we sent"
+    - "two-factor"
+    - "otp"
+
+  confirm_before_click_text:
+    - "delete"
+    - "remove"
+    - "submit"
+    - "place order"
+    - "pay now"
+    - "send"
+    - "confirm"
+    - "publish"
+
+logging:
+  dir: logs

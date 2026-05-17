@@ -1,0 +1,85 @@
+# Pinchtab Cloud SG — single-host deployment.
+#
+# Two services:
+#   - pinchtab : the browser-control daemon (Go, port 9867). NOT exposed
+#                to the host; reached only via docker internal DNS.
+#   - backend  : FastAPI control plane (port 8000), facing the world.
+#
+# Assumes the pinchtab source is cloned at ../pinchtab (sibling of this repo).
+# To customize pinchtab (e.g. add eTLD+1 normalization to the IDPI guard),
+# edit the upstream clone and rebuild.
+
+services:
+  pinchtab:
+    container_name: pt_pinchtab
+    build:
+      # Cloned upstream source. Adjust if you put it elsewhere.
+      context: ../pinchtab
+      dockerfile: Dockerfile
+    networks:
+      - app
+    environment:
+      # Daemon runs headless inside the container; backend never asks for
+      # the anti-detection surface (stealth/fingerprint endpoints are not
+      # exposed by our backend client — see backend/pinchtab_client.py).
+      - BRIDGE_HEADLESS=true
+      - BRIDGE_BIND_ADDR=0.0.0.0
+    volumes:
+      # Persist profile dirs across restarts so user sessions survive.
+      - pinchtab_profiles:/data
+    restart: unless-stopped
+    # NOTE: no `ports:` mapping. Pinchtab is not reachable from the host.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9867/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  backend:
+    container_name: pt_backend
+    build:
+      context: .
+      dockerfile: Dockerfile
+    networks:
+      - app
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      - APP_ENV=production
+      - APP_BASE_URL=${APP_BASE_URL:-http://localhost:8000}
+      - APP_SECRET_KEY=${APP_SECRET_KEY:?APP_SECRET_KEY must be set}
+      - WORKER_SHARED_SECRET=${WORKER_SHARED_SECRET:?WORKER_SHARED_SECRET must be set}
+      - WORKER_BASE_URL=http://pinchtab:9867
+      - DATABASE_URL=${DATABASE_URL:-sqlite:////data/pinchtab.db}
+      - MAX_CONCURRENT_SESSIONS=${MAX_CONCURRENT_SESSIONS:-10}
+      - SESSION_IDLE_TIMEOUT_SECONDS=${SESSION_IDLE_TIMEOUT_SECONDS:-30}
+      - SESSION_HARD_CAP_MINUTES=${SESSION_HARD_CAP_MINUTES:-30}
+      # Email + Stripe — leave blank in non-prod; tasks endpoints still work.
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - EMAIL_FROM=${EMAIL_FROM:-noreply@pinchtab.local}
+      - STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY:-}
+      - STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET:-}
+      - STRIPE_PRICE_STARTER=${STRIPE_PRICE_STARTER:-}
+      - STRIPE_PRICE_PRO=${STRIPE_PRICE_PRO:-}
+      - RATE_LIMIT_PER_USER=${RATE_LIMIT_PER_USER:-60/minute}
+    volumes:
+      # SQLite + agent step logs land here.
+      - backend_data:/data
+      - backend_logs:/app/logs
+    restart: unless-stopped
+    depends_on:
+      pinchtab:
+        condition: service_healthy
+
+networks:
+  app:
+    # Default bridge driver. Permits outbound (Anthropic API, Stripe, etc.)
+    # while still isolating pinchtab from the host since pinchtab has no
+    # `ports:` mapping.
+    driver: bridge
+
+volumes:
+  pinchtab_profiles:
+  backend_data:
+  backend_logs:

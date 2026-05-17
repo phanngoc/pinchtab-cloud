@@ -1,0 +1,47 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+
+# Local state — never bake into image.
+.env
+*.db
+*.db-journal
+pinchtab.db
+logs/
+config.yaml
+
+# Tests not needed at runtime.
+tests/
+
+# Old prototype CLI scripts (kept in repo for local dev, not in image).
+agent.py
+tools.py
+fb_post.py
+config.example.yaml
+
+# Editor / IDE / OS junk.
+.idea/
+.vscode/
+.DS_Store
+
+# Build outputs from elsewhere.
+dist/
+build/
+node_modules/
+.next/
+
+# Git
+.git/
+.gitignore
+
+# Docker meta
+Dockerfile*
+docker-compose*.yml
+.dockerignore

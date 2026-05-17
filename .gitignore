@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+config.yaml
+logs/
+.pytest_cache/
+.ruff_cache/
+
+# Backend runtime
+pinchtab.db
+pinchtab.db-journal
+*.sqlite
+*.sqlite-journal
+alembic/versions/__pycache__/
+
+# Build artifacts
+dist/
+build/
+node_modules/
+.next/
