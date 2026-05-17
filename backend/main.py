@@ -12,7 +12,9 @@ Run:
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import shutil
 import time
 from contextlib import asynccontextmanager
 
@@ -35,6 +37,47 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("pinchtab")
 
 
+async def _warmup_claude_cli() -> None:
+    """Pre-warm the claude CLI so the first real task's first-step latency
+    isn't paying for: node.js boot, V8 JIT, OS file cache for ~/.claude/*,
+    and Anthropic auth handshake. Best-effort: any failure logs a warning
+    and the app continues."""
+    bin_path = shutil.which("claude")
+    if not bin_path:
+        return  # SDK-only deployment, nothing to warm.
+    try:
+        from backend.llm_cli import _EMPTY_MCP_CONFIG
+        cmd = [
+            bin_path, "--print",
+            "--disallowedTools", "*", "--effort", "low",
+            "--exclude-dynamic-system-prompt-sections",
+            "--strict-mcp-config", "--mcp-config", _EMPTY_MCP_CONFIG,
+            "--no-session-persistence",
+            "--model", "sonnet",
+        ]
+        t0 = time.time()
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(
+            proc.communicate(b"reply with the single word: ok"),
+            timeout=15.0,
+        )
+        log.info("claude CLI warmup done in %.1fs", time.time() - t0)
+    except asyncio.TimeoutError:
+        log.warning("claude CLI warmup timed out (>15s) — first task may be slow")
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("claude CLI warmup failed: %s — first task may be slow", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -49,6 +92,11 @@ async def lifespan(app: FastAPI):
             base_url=settings.worker_base_url,
             token=settings.pinchtab_token or None,
         )
+
+    # Warm the claude CLI cache so the first real task's step 1 isn't the
+    # cold-path. Fire-and-forget, capped at ~15s, never blocks startup.
+    if settings.app_env != "production":
+        asyncio.create_task(_warmup_claude_cli())
 
     try:
         yield

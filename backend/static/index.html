@@ -174,6 +174,10 @@
     <div class="muted mono" id="task-meta"></div>
     <div class="log" id="event-log"></div>
     <div style="margin-top: 10px" class="row">
+      <input id="hint-input" placeholder="Gợi ý cho agent (vd: 'không cần đăng nhập, chỉ scroll trang chủ')" style="flex: 1" />
+      <button onclick="sendHint()" id="btn-hint" class="ghost" style="flex: 0 0 120px">📨 Gửi gợi ý</button>
+    </div>
+    <div style="margin-top: 10px" class="row">
       <button onclick="haltTask()" id="btn-halt" class="ghost" style="flex: 0 0 140px" disabled>Halt</button>
       <button onclick="resetView()" class="ghost" style="flex: 0 0 140px">Tasks mới</button>
     </div>
@@ -562,6 +566,9 @@ function appendEvent(ev){
     case 'llm_call':
       body = `<span style="color:#6ab4ff">🧠 LLM thinking…</span> <span class="muted">(${ev.prompt_messages} msgs)</span>`;
       break;
+    case 'llm_retry':
+      body = `<span style="color:#ffd166">↻ LLM retry (attempt 2/2)</span> <span class="muted">after ${ev.elapsed_seconds}s · ${escapeHtml(ev.error || '')}</span>`;
+      break;
     case 'llm_done':
       const cls = ev.error ? 'var(--err)' : 'var(--ok)';
       const tag = ev.error ? `error ${escapeHtml(ev.error)}` : 'response received';
@@ -588,6 +595,15 @@ function appendEvent(ev){
     case 'input_timeout':
       body = `<span style="color:var(--err)">⏱ input timeout (${ev.timeout_seconds}s) — task halted</span>`;
       hideInputForm();
+      break;
+    case 'hint_sent':
+      body = `<span style="color:#ffd166">📨 you sent hint:</span> ${escapeHtml(ev.message)}`;
+      break;
+    case 'hint_delivered':
+      body = `<span style="color:#ffd166">📨 ${ev.count} hint(s) delivered to agent this turn</span>`;
+      break;
+    case 'loop_detected':
+      body = `<span style="color:var(--err)">🔁 loop detected — agent called <b>${escapeHtml(ev.tool)}</b> 3+ times in last 5 turns. Halting.</span>`;
       break;
     case 'open':
       body = `<span class="ev-open">${escapeHtml(ev.task_id || ev.message)}</span>`;
@@ -752,6 +768,24 @@ async function streamEvents(taskId){
   }
 }
 
+async function sendHint(){
+  if (!currentTaskId) return;
+  const txt = $('hint-input').value.trim();
+  if (!txt) return;
+  const r = await fetch(`/tasks/${currentTaskId}/hint`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', 'authorization': `Bearer ${currentBearer}`},
+    body: JSON.stringify({message: txt})
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(()=>({}));
+    alert(`Gửi gợi ý fail: ${r.status} ${j.detail || ''}`);
+    return;
+  }
+  appendEvent({type:'hint_sent', message: txt});
+  $('hint-input').value = '';
+}
+
 async function haltTask(){
   if (!currentTaskId) return;
   const r = await fetch(`/tasks/${currentTaskId}/halt`, {
@@ -767,6 +801,9 @@ function resetView(){
   if (currentPollHandle) { clearInterval(currentPollHandle); currentPollHandle = null; }
   stopArtifactPoll();
   currentTaskId = null;
+  if (location.hash.startsWith('#/task/')) {
+    history.pushState(null, '', '/');
+  }
 }
 
 async function refreshHistory(){
@@ -794,7 +831,11 @@ async function refreshHistory(){
 }
 
 async function openHistoricalTask(taskId, profileId, status){
-  // Click a history row → load that task's artifacts + summary, no live stream.
+  // Click a history row → load full persisted event log + artifacts. No live stream.
+  // Updates URL hash so the detail view is deep-linkable / browser-back-friendly.
+  if (location.hash !== `#/task/${taskId}`) {
+    history.pushState(null, '', `#/task/${taskId}`);
+  }
   const r = await fetch(`/tasks/${taskId}`, {
     headers: {'authorization': `Bearer ${currentBearer}`}
   });
@@ -804,8 +845,8 @@ async function openHistoricalTask(taskId, profileId, status){
   show('card-stream');
   $('task-status').textContent = t.status;
   $('task-status').className = 'pill ' + statusClass(t.status);
-  $('task-meta').innerHTML = `task=<span style="color:#fff">${t.id}</span> · profile=<span style="color:#fff">${t.profile_id}</span> · <span class="muted">historical view</span>`;
-  $('event-log').innerHTML = '<div class="muted">Live stream not available for historical tasks. Showing artifacts only.</div>';
+  $('task-meta').innerHTML = `task=<span style="color:#fff">${t.id}</span> · profile=<span style="color:#fff">${t.profile_id}</span> · <span class="muted">historical view</span> · <a href="#" onclick="resetView();return false" style="color:var(--accent)">← back</a>`;
+  $('event-log').innerHTML = '';
   $('btn-halt').disabled = true;
   if (t.final_summary) {
     $('task-summary').innerHTML = `<b>Summary:</b> ${escapeHtml(t.final_summary)}`;
@@ -814,8 +855,42 @@ async function openHistoricalTask(taskId, profileId, status){
   } else {
     $('task-summary').innerHTML = '';
   }
+  // Replay persisted event log into the same UI machinery the live stream uses.
+  try {
+    const hr = await fetch(`/tasks/${taskId}/history`, {
+      headers: {'authorization': `Bearer ${currentBearer}`}
+    });
+    if (hr.ok) {
+      const events = await hr.json();
+      if (events.length === 0) {
+        $('event-log').innerHTML = '<div class="muted">No persisted events for this run (older run before history was added, or never started).</div>';
+      } else {
+        for (const ev of events) {
+          appendEvent({type: ev.kind, ...(ev.payload || {})});
+        }
+      }
+    } else {
+      $('event-log').innerHTML = `<div class="muted">History fetch failed (${hr.status}).</div>`;
+    }
+  } catch (e) {
+    $('event-log').innerHTML = `<div class="muted">History fetch error: ${escapeHtml(String(e))}</div>`;
+  }
   refreshStepStrip(taskId);
 }
+
+// Hash-based detail routing: support deep-link / browser back/forward.
+async function routeFromHash(){
+  const m = (location.hash || '').match(/^#\/task\/([0-9a-f]{8,32})$/);
+  if (m && currentBearer) {
+    if (currentTaskId !== m[1]) {
+      await openHistoricalTask(m[1]);
+    }
+  } else if (currentTaskId && (location.hash === '' || location.hash === '#')) {
+    // User navigated back from a detail link → close detail view.
+    resetView();
+  }
+}
+window.addEventListener('hashchange', routeFromHash);
 
 // Bootstrap: URL fragment seed login for dev/share flows.
 // Format:  http://host/#bearer=...&email=...
@@ -836,6 +911,8 @@ async function openHistoricalTask(taskId, profileId, status){
 
 if (currentBearer) {
   enterLoggedIn();
+  // Resolve any deep-link hash (e.g. /#/task/<id>) after login.
+  routeFromHash();
 }
 </script>
 </body>

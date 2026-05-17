@@ -40,6 +40,25 @@ from typing import Any
 log = logging.getLogger("llm_cli")
 
 
+def _empty_mcp_config_path() -> str:
+    """Ensure a stable on-disk empty MCP config exists; return its path.
+
+    The agent runner doesn't use any MCP tools — it only needs claude as a
+    raw LLM responder. We pass `--strict-mcp-config --mcp-config <this>` so
+    claude skips loading the user's 7 default MCP servers (deepwiki, serena,
+    magic, context7, sequential-thinking, morphllm-fast-apply, playwright).
+    This trims cold-start by 1-3s AND avoids hanging when any MCP server
+    misbehaves on startup."""
+    cfg_path = Path.home() / ".claude" / "pinchtab-empty-mcp.json"
+    if not cfg_path.exists():
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text('{"mcpServers": {}}\n')
+    return str(cfg_path)
+
+
+_EMPTY_MCP_CONFIG = _empty_mcp_config_path()
+
+
 # ---- Mock content blocks matching the Anthropic SDK shape ----
 
 
@@ -247,7 +266,7 @@ class ClaudeCLIProvider:
     def __init__(
         self,
         claude_bin: str | None = None,
-        timeout_seconds: float = 120.0,
+        timeout_seconds: float = 180.0,
         model_arg: str | None = "sonnet",
     ):
         bin_path = claude_bin or shutil.which("claude")
@@ -260,6 +279,20 @@ class ClaudeCLIProvider:
         self.timeout = timeout_seconds
         self.model_arg = model_arg
         self.messages = _MessagesAPI(self)
+        # Session state (stateful per task).
+        #
+        # First _create() call generates a UUID and runs `--session-id <uuid>`
+        # with the full prompt. Subsequent calls run `--resume <uuid>` with
+        # ONLY the new user messages since the last call. claude CLI maintains
+        # its own conversation history on disk; we avoid re-feeding 30+ turns
+        # of context on every subprocess call.
+        #
+        # Token impact, observed: 30-step run before = ~210KB cumulative
+        # prompt across all subprocess invocations. With session mode:
+        # turn 1 = 6KB (full), turns 2-30 = ~1KB each (just new snap +
+        # tool_result). Total ~36KB. ~6x less work for claude per turn.
+        self.session_id: str | None = None
+        self._messages_sent_count = 0
 
     async def _create(
         self,
@@ -270,26 +303,62 @@ class ClaudeCLIProvider:
         tools: list[dict],
         messages: list[dict],
     ) -> _Response:
-        prompt = build_cli_prompt(system, tools, messages)
+        import uuid as _uuid
+
+        # First call vs resume: shape command + prompt accordingly.
+        if self.session_id is None:
+            # First turn: full prompt (system + tools + initial conversation).
+            self.session_id = str(_uuid.uuid4())
+            prompt = build_cli_prompt(system, tools, messages)
+            mode_args = ["--session-id", self.session_id]
+            self._messages_sent_count = len(messages)
+            log.info(
+                "claude CLI new session %s (initial prompt: %d bytes)",
+                self.session_id[:8], len(prompt),
+            )
+        else:
+            # Resume: send ONLY new user messages since last call. Assistant
+            # responses are already in claude's session from prior --resume
+            # turns; sending them again wastes tokens and confuses the model.
+            new_msgs = messages[self._messages_sent_count :]
+            new_user_msgs = [m for m in new_msgs if m.get("role") == "user"]
+            if not new_user_msgs:
+                # Defensive: nothing new to send. Shouldn't normally happen
+                # since the runner appends a user message every turn.
+                new_user_msgs = [{"role": "user", "content": "continue"}]
+            prompt = "\n\n".join(
+                _flatten_message_content(m.get("content", ""))
+                for m in new_user_msgs
+            )
+            mode_args = ["--resume", self.session_id]
+            self._messages_sent_count = len(messages)
+            log.info(
+                "claude CLI resume %s (delta: %d bytes, %d new user msgs)",
+                self.session_id[:8], len(prompt), len(new_user_msgs),
+            )
+
         cmd = [
             self.bin,
             "--print",
+            *mode_args,
             # Disable Claude Code's built-in tools (Bash/Read/Edit/etc.) so
-            # the CLI behaves as a pure LLM responder for our text-shaped
-            # browser-automation prompts.
+            # the CLI behaves as a pure LLM responder for our prompts.
             "--disallowedTools", "*",
-            # No session files on disk; we manage history in-process.
-            "--no-session-persistence",
-            # Speed: don't burn reasoning budget on our small per-step task.
+            # Speed: don't burn reasoning budget on our per-step task.
             "--effort", "low",
-            # Strip Claude Code's per-machine system prompt sections (cwd,
-            # git status, etc.) — irrelevant noise that costs tokens.
+            # Strip Claude Code's per-machine system prompt sections.
             "--exclude-dynamic-system-prompt-sections",
+            # Skip MCP server loading — runner uses zero MCP tools, and
+            # any one of the user's 7 default MCP servers hanging on
+            # startup would hang our subprocess too. Saves cold-start +
+            # eliminates a hang class.
+            "--strict-mcp-config", "--mcp-config", _EMPTY_MCP_CONFIG,
         ]
         if self.model_arg:
             cmd += ["--model", self.model_arg]
 
-        log.info("invoking claude CLI: %d-byte prompt", len(prompt))
+        # NOTE: do NOT pass --no-session-persistence; we WANT the session
+        # written to disk so --resume can pick it up on the next turn.
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -306,7 +375,19 @@ class ClaudeCLIProvider:
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
-            raise RuntimeError(f"claude CLI timed out after {self.timeout}s")
+            # Surface anything claude wrote to stderr before we killed it —
+            # otherwise timeouts give zero forensic signal in the agent log.
+            stderr_tail = ""
+            try:
+                if proc.stderr is not None:
+                    stderr_bytes = await asyncio.wait_for(proc.stderr.read(), timeout=1.0)
+                    stderr_tail = stderr_bytes.decode("utf-8", errors="replace")[-300:]
+            except (asyncio.TimeoutError, Exception):
+                pass
+            msg = f"claude CLI timed out after {self.timeout}s"
+            if stderr_tail.strip():
+                msg += f" (stderr tail: {stderr_tail.strip()})"
+            raise RuntimeError(msg)
 
         if proc.returncode != 0:
             err = stderr.decode("utf-8", errors="replace")[:500]

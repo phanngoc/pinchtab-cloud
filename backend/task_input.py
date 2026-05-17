@@ -38,6 +38,30 @@ class FieldSpec:
         )
 
 
+class HintBox:
+    """Per-task hint queue. The user can push a course-correction message
+    via POST /tasks/{id}/hint; the agent runner drains it on the next turn
+    and includes the hint text in the user message it sends to the LLM."""
+
+    def __init__(self):
+        self._hints: dict[str, list[str]] = {}
+
+    def push(self, task_id: str, text: str) -> int:
+        bucket = self._hints.setdefault(task_id, [])
+        bucket.append(text.strip()[:1000])  # cap each hint at 1KB
+        bucket[:] = bucket[-5:]  # keep at most the last 5 unread
+        return len(bucket)
+
+    def drain(self, task_id: str) -> list[str]:
+        return self._hints.pop(task_id, [])
+
+    def peek(self, task_id: str) -> list[str]:
+        return list(self._hints.get(task_id, []))
+
+
+hint_box = HintBox()
+
+
 @dataclass
 class PendingInput:
     prompt: str

@@ -15,9 +15,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from backend.agent_runner import AgentResult, run_task
+from backend.agent_runner import (
+    AgentResult,
+    _execute_tool,
+    _extract_refs,
+    run_task,
+)
 from backend.db import Base
-from backend.models import Profile, Task, TaskStatus, User
+from backend.models import Profile, Task, TaskEvent, TaskStatus, User
 
 
 # ---------------------------------------------------------------------------
@@ -396,15 +401,19 @@ async def test_open_tab_failure_errors_task_at_setup(db_factory, seed, tmp_path)
 @pytest.mark.asyncio
 async def test_max_steps_reached_errors(db_factory, seed, tmp_path):
     _, _, task_id = seed
-    # Claude keeps scrolling forever — never task_complete.
-    looping_response = [_tool_use_block("scroll", amount="500")]
+    # Claude keeps scrolling forever with VARYING args — never task_complete.
+    # Args vary each step so the (tool, args) loop detector does NOT fire;
+    # this isolates the max_steps safety net.
     fake_pt = FakePinchtabClient(snap_text_sequence=["e1:link \"X\""])
+    varied_responses = [
+        [_tool_use_block("scroll", amount=str(100 * (i + 1)))] for i in range(10)
+    ]
 
     res = await run_task(
         task_id,
         anthropic_api_key="sk-fake",
         pinchtab_client=fake_pt,
-        anthropic_factory=anthropic_factory_for([looping_response] * 10),
+        anthropic_factory=anthropic_factory_for(varied_responses),
         db_session_factory=db_factory,
         max_steps=3,
         log_dir=tmp_path,
@@ -414,6 +423,225 @@ async def test_max_steps_reached_errors(db_factory, seed, tmp_path):
     assert res.terminal == TaskStatus.errored
     assert "max_steps" in res.error_message
     assert res.steps == 3
+
+
+def test_extract_refs_handles_real_snap_format():
+    snap = (
+        "# Page title | https://example.com | 12 nodes\n"
+        'e2:link "Home"\n'
+        'e5:button "Login"\n'
+        "e42:textbox \"Search\"\n"
+        # noise lines that should NOT match
+        "Just some prose with e99 in the middle (no colon).\n"
+        "  e7:not-anchored (leading space, must not match)\n"
+    )
+    assert _extract_refs(snap) == {"e2", "e5", "e42"}
+    assert _extract_refs("") == set()
+
+
+@pytest.mark.asyncio
+async def test_stale_ref_rejected_before_pinchtab_call():
+    """Clicking a ref that's not in the current snap returns a helpful error
+    WITHOUT calling pinchtab — saves wasted roundtrips on detached/old refs."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    class TrackingClient:
+        async def click(self, tab_id, ref):
+            calls.append(("click", {"ref": ref}))
+            return {"clicked": True}
+
+    res, stop, term, _ = await _execute_tool(
+        TrackingClient(),  # type: ignore[arg-type]
+        "tab-x",
+        "click",
+        {"ref": "e999"},
+        None,  # type: ignore[arg-type]
+        current_refs={"e2", "e5"},
+    )
+    assert calls == []  # pinchtab was NEVER hit
+    assert "ref 'e999' is not in the current snap" in res
+    assert "e2" in res and "e5" in res  # suggestion includes valid refs
+    assert stop is False and term is None
+
+
+@pytest.mark.asyncio
+async def test_valid_ref_passes_through_to_pinchtab():
+    """Sanity: a ref present in current_refs is forwarded to the client."""
+    class TrackingClient:
+        async def click(self, tab_id, ref):
+            return {"clicked": True, "ref": ref}
+
+    res, _, _, _ = await _execute_tool(
+        TrackingClient(),  # type: ignore[arg-type]
+        "tab-x",
+        "click",
+        {"ref": "e5"},
+        None,  # type: ignore[arg-type]
+        current_refs={"e2", "e5"},
+    )
+    assert '"clicked": true' in res
+
+
+@pytest.mark.asyncio
+async def test_ref_guard_skipped_when_current_refs_is_none():
+    """Tests / callers that don't pass current_refs (legacy behavior) keep working."""
+    class TrackingClient:
+        async def click(self, tab_id, ref):
+            return {"clicked": True}
+
+    res, _, _, _ = await _execute_tool(
+        TrackingClient(),  # type: ignore[arg-type]
+        "tab-x",
+        "click",
+        {"ref": "e999"},
+        None,  # type: ignore[arg-type]
+        current_refs=None,
+    )
+    assert '"clicked": true' in res
+
+
+@pytest.mark.asyncio
+async def test_llm_call_retries_once_on_transient_failure(db_factory, seed, tmp_path):
+    """A transient exception on the first messages.create() attempt should
+    trigger one retry; second attempt succeeding lets the task continue.
+    Mirrors the CLI 120s-timeout failure mode observed in production."""
+    _, _, task_id = seed
+    success_blocks = [_tool_use_block("task_complete", summary="recovered after retry")]
+    fake_pt = FakePinchtabClient(snap_text_sequence=["e1:link \"X\""])
+
+    # Anthropic-like client: first call raises, subsequent calls return success.
+    class FlakyMessages:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("simulated CLI timeout after 180.0s")
+            return _Response(success_blocks)
+
+    class FlakyAnthropic:
+        def __init__(self):
+            self.messages = FlakyMessages()
+            # Presence of session_id makes the runner treat this as CLI mode
+            # and reset on retry — exercises that code path.
+            self.session_id = "stale-session-uuid"
+            self._messages_sent_count = 999
+
+    flaky = FlakyAnthropic()
+
+    def factory(_key):
+        return flaky
+
+    res = await run_task(
+        task_id,
+        anthropic_api_key="sk-fake",
+        pinchtab_client=fake_pt,
+        anthropic_factory=factory,
+        db_session_factory=db_factory,
+        max_steps=3,
+        log_dir=tmp_path,
+        step_delay_seconds=0.0,
+    )
+
+    # Task completed because attempt 2 succeeded.
+    assert res.terminal == TaskStatus.done
+    assert flaky.messages.calls == 2  # exactly one retry
+    # CLI session was reset before the retry — proves the reset path fired.
+    assert flaky.session_id is None
+    assert flaky._messages_sent_count == 0
+
+
+@pytest.mark.asyncio
+async def test_llm_call_fails_after_second_retry(db_factory, seed, tmp_path):
+    """If both attempts fail, task errors with last exception's message."""
+    _, _, task_id = seed
+    fake_pt = FakePinchtabClient(snap_text_sequence=["e1:link \"X\""])
+
+    class AlwaysFailMessages:
+        def __init__(self):
+            self.calls = 0
+
+        async def create(self, **kwargs):
+            self.calls += 1
+            raise RuntimeError("permanent failure")
+
+    class AlwaysFailAnthropic:
+        def __init__(self):
+            self.messages = AlwaysFailMessages()
+
+    af = AlwaysFailAnthropic()
+    res = await run_task(
+        task_id,
+        anthropic_api_key="sk-fake",
+        pinchtab_client=fake_pt,
+        anthropic_factory=lambda _k: af,
+        db_session_factory=db_factory,
+        max_steps=3,
+        log_dir=tmp_path,
+        step_delay_seconds=0.0,
+    )
+    assert res.terminal == TaskStatus.errored
+    assert af.messages.calls == 2  # 1 attempt + 1 retry, then give up
+    assert "permanent failure" in (res.error_message or "")
+
+
+@pytest.mark.asyncio
+async def test_events_persisted_to_db(db_factory, seed, tmp_path):
+    """Runner writes a TaskEvent row for every event it publishes —
+    enabling after-the-fact history view in the dashboard."""
+    _, _, task_id = seed
+    scripted = [[_tool_use_block("task_complete", summary="all done")]]
+    fake_pt = FakePinchtabClient(snap_text_sequence=["e1:link \"X\""])
+
+    await run_task(
+        task_id,
+        anthropic_api_key="sk-fake",
+        pinchtab_client=fake_pt,
+        anthropic_factory=anthropic_factory_for(scripted),
+        db_session_factory=db_factory,
+        max_steps=3,
+        log_dir=tmp_path,
+        step_delay_seconds=0.0,
+    )
+
+    with db_factory() as db:
+        events = db.query(TaskEvent).filter(TaskEvent.task_id == task_id).order_by(TaskEvent.id).all()
+        kinds = [e.kind for e in events]
+        # We don't pin the exact event sequence (it would couple the test to
+        # publish-call ordering), but we require: started, ≥1 step, ≥1
+        # tool_call, terminal.
+        assert "started" in kinds
+        assert "step" in kinds
+        assert "tool_call" in kinds
+        assert "terminal" in kinds
+        # Every event has parseable JSON payload.
+        import json as _json
+        for e in events:
+            _json.loads(e.payload_json)
+
+
+@pytest.mark.asyncio
+async def test_tool_loop_detector_halts(db_factory, seed, tmp_path):
+    """Agent calling same (tool, args) 3+ times in last 5 turns triggers halt."""
+    _, _, task_id = seed
+    # Identical scroll(500) every turn — loop detector should fire by step 3.
+    looping_response = [_tool_use_block("scroll", amount="500")]
+    fake_pt = FakePinchtabClient(snap_text_sequence=["e1:link \"X\""])
+
+    res = await run_task(
+        task_id,
+        anthropic_api_key="sk-fake",
+        pinchtab_client=fake_pt,
+        anthropic_factory=anthropic_factory_for([looping_response] * 10),
+        db_session_factory=db_factory,
+        max_steps=10,
+        log_dir=tmp_path,
+        step_delay_seconds=0.0,
+    )
+
+    assert res.terminal == TaskStatus.halted
+    assert "loop" in (res.error_message or "").lower() or res.steps <= 5
 
 
 @pytest.mark.asyncio

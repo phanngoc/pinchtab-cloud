@@ -23,12 +23,13 @@ from backend.models import (
     InvalidTaskTransition,
     Profile,
     Task,
+    TaskEvent,
     TaskStatus,
     User,
 )
 from backend.security import current_user
 from backend.task_bus import END_SENTINEL, bus, registry
-from backend.task_input import registry as input_registry
+from backend.task_input import hint_box, registry as input_registry
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -293,6 +294,34 @@ async def provide_input(
     return {"status": "received"}
 
 
+class HintBody(BaseModel):
+    message: str = Field(min_length=1, max_length=1000)
+
+
+@router.post("/{task_id}/hint")
+async def push_hint(
+    task_id: str,
+    body: HintBody,
+    user: User = Depends(current_user),
+    db: DbSession = Depends(get_db),
+) -> dict:
+    """Push a human course-correction note to a running task. The agent
+    sees the hint as `[HUMAN HINT]: <text>` appended to its next user
+    message — used to redirect the agent away from a stuck loop or
+    clarify intent. Only accepted while the task is live (pending/running).
+    """
+    t = db.get(Task, task_id)
+    if t is None or t.user_id != user.id:
+        raise HTTPException(status_code=404, detail="not_found")
+    if t.status not in (TaskStatus.pending, TaskStatus.running, TaskStatus.halted):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is {t.status.value}; cannot accept hints",
+        )
+    count = hint_box.push(task_id, body.message)
+    return {"status": "queued", "pending_hints": count}
+
+
 @router.post("/{task_id}/halt", response_model=TaskOut)
 async def halt(
     task_id: str, user: User = Depends(current_user), db: DbSession = Depends(get_db)
@@ -315,6 +344,49 @@ async def halt(
     # Re-read after cancel: runner should have written halted.
     db.refresh(t)
     return _to_out(t)
+
+
+class HistoryEvent(BaseModel):
+    id: int
+    step: int | None
+    kind: str
+    payload: dict
+    created_at: datetime
+
+
+@router.get("/{task_id}/history", response_model=list[HistoryEvent])
+async def get_history(
+    task_id: str,
+    user: User = Depends(current_user),
+    db: DbSession = Depends(get_db),
+    since_id: int = 0,
+    limit: int = 2000,
+) -> list[HistoryEvent]:
+    """Persisted full event log for a task — used by the run-detail view
+    to render the timeline after the SSE stream is gone. Pass `since_id`
+    to fetch only events newer than a known id (cheap incremental load)."""
+    t = db.get(Task, task_id)
+    if t is None or t.user_id != user.id:
+        raise HTTPException(status_code=404, detail="not_found")
+    limit = max(1, min(int(limit), 5000))
+    rows = db.execute(
+        select(TaskEvent)
+        .where(TaskEvent.task_id == task_id, TaskEvent.id > int(since_id))
+        .order_by(TaskEvent.id.asc())
+        .limit(limit)
+    ).scalars().all()
+    out: list[HistoryEvent] = []
+    for r in rows:
+        try:
+            p = json.loads(r.payload_json or "{}")
+            if not isinstance(p, dict):
+                p = {"value": p}
+        except json.JSONDecodeError:
+            p = {"_raw": (r.payload_json or "")[:500]}
+        out.append(HistoryEvent(
+            id=r.id, step=r.step, kind=r.kind, payload=p, created_at=r.created_at,
+        ))
+    return out
 
 
 # ---- Artifacts: per-step screenshots / snapshots from log dir ----

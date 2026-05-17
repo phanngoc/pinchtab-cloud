@@ -179,6 +179,32 @@ class Task(Base):
             self.ended_at = now
 
 
+class TaskEvent(Base):
+    """Append-only timeline of agent events per task.
+
+    Mirrors every SSE event the runner emits (step, llm_call, llm_done,
+    tool_call, tool_result, loop_detected, hint_delivered, awaiting_input,
+    terminal, etc.) so the dashboard can render full run history after
+    the live stream is gone. payload_json is the event dict minus `type`,
+    truncated at 8 KB per row.
+    """
+
+    __tablename__ = "task_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("tasks.id"), index=True, nullable=False
+    )
+    step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
+
+    __table_args__ = (Index("ix_task_event_task_created", "task_id", "created_at"),)
+
+
 class StripeEvent(Base):
     """Idempotency table for Stripe webhook events (CEO review S4)."""
 

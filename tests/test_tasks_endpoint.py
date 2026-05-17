@@ -216,6 +216,78 @@ def test_list_and_get_after_dispatch():
         assert r.json()["id"] == task_id
 
 
+def test_history_endpoint_returns_persisted_events():
+    """End-to-end: a task with persisted TaskEvent rows is queryable via
+    GET /tasks/{id}/history and respects since_id incremental loading."""
+    from backend.db import SessionLocal
+    from backend.models import TaskEvent
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+        r = c.post(
+            "/tasks",
+            json={"task_description": "task with history", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        task_id = r.json()["id"]
+
+        # Simulate runner persisting events (real runner does this via _publish).
+        sess = SessionLocal()
+        try:
+            sess.add(TaskEvent(task_id=task_id, step=1, kind="step", payload_json='{"step": 1}'))
+            sess.add(TaskEvent(task_id=task_id, step=1, kind="tool_call", payload_json='{"name": "scroll", "params": {"amount": "500"}}'))
+            sess.add(TaskEvent(task_id=task_id, step=None, kind="terminal", payload_json='{"status": "done", "steps": 1}'))
+            sess.commit()
+        finally:
+            sess.close()
+
+        r = c.get(f"/tasks/{task_id}/history", headers={"Authorization": f"Bearer {bearer}"})
+        assert r.status_code == 200
+        events = r.json()
+        assert len(events) == 3
+        assert [e["kind"] for e in events] == ["step", "tool_call", "terminal"]
+        assert events[1]["payload"]["name"] == "scroll"
+        assert events[2]["step"] is None
+
+        # since_id pagination
+        last_id = events[0]["id"]
+        r = c.get(
+            f"/tasks/{task_id}/history?since_id={last_id}",
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 200
+        assert len(r.json()) == 2
+
+
+def test_history_endpoint_rejects_other_users_task():
+    """A user querying another user's task history gets 404, not 403."""
+    from backend.db import SessionLocal
+    from backend.models import TaskEvent
+    with TestClient(app) as c:
+        bearer_a = _signup(c)
+        _install_dispatcher_recorder(c)
+        ra = c.post(
+            "/tasks",
+            json={"task_description": "alice task", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer_a}"},
+        )
+        task_id = ra.json()["id"]
+        sess = SessionLocal()
+        try:
+            sess.add(TaskEvent(task_id=task_id, kind="step", payload_json="{}"))
+            sess.commit()
+        finally:
+            sess.close()
+
+        # Bob signs up + tries to read Alice's task.
+        rb = c.post("/auth/request-link", json={"email": "bob@example.com"})
+        bob_token = rb.json()["dev_link"].split("token=", 1)[1]
+        bob_bearer = c.post("/auth/verify", json={"token": bob_token}).json()["bearer"]
+
+        r = c.get(f"/tasks/{task_id}/history", headers={"Authorization": f"Bearer {bob_bearer}"})
+        assert r.status_code == 404
+
+
 def test_second_task_reuses_same_profile():
     with TestClient(app) as c:
         bearer = _signup(c)

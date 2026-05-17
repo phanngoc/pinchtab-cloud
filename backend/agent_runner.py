@@ -41,12 +41,13 @@ from backend.models import (
     InvalidTaskTransition,
     Profile,
     Task,
+    TaskEvent,
     TaskStatus,
     UsageMetric,
 )
 from backend.pinchtab_client import PinchtabClient
 from backend.task_bus import TaskBus, bus as default_bus
-from backend.task_input import registry as input_registry
+from backend.task_input import hint_box, registry as input_registry
 from core.prompts import HARDENED_SYSTEM_PROMPT
 
 
@@ -467,14 +468,53 @@ async def _open_tab_and_secure(
 # ---- Tool execution ----
 
 
+_REF_RE = re.compile(r"^(e\d+):", re.MULTILINE)
+_REF_TAKING_TOOLS = frozenset({"click", "fill", "type_text", "select_option"})
+
+
+def _extract_refs(snap_text: str) -> set[str]:
+    """Pull all `eXX` refs from the current snap. Lines look like
+    `e7:button "Login"` — refs are anchored at line start, end in `:`."""
+    return set(_REF_RE.findall(snap_text or ""))
+
+
+def _stale_ref_error(ref: str, current_refs: set[str]) -> str:
+    """Helpful tool_result when the agent passed a ref not in the latest snap.
+    Lists a sample of valid refs so the agent self-corrects on the next turn
+    without another pinchtab roundtrip."""
+    sample = sorted(current_refs, key=lambda r: int(r[1:]))[:25]
+    sample_str = ", ".join(sample) if sample else "<none>"
+    return (
+        f"ERROR: ref '{ref}' is not in the current snap. Refs are valid ONLY "
+        f"for the most recent snapshot — old refs from prior turns are stale "
+        f"after any navigation or DOM mutation. Re-read the latest snap above "
+        f"and pick a ref from there. Available refs (first 25): {sample_str}"
+    )
+
+
 async def _execute_tool(
     client: PinchtabClient,
     tab_id: str,
     name: str,
     params: dict[str, Any],
     policy: DenylistPolicy,
+    current_refs: set[str] | None = None,
 ) -> tuple[str, bool, TaskStatus | None, str | None]:
-    """Run a single tool call. Returns (result_text, should_stop, terminal_status, finalize_summary)."""
+    """Run a single tool call. Returns (result_text, should_stop, terminal_status, finalize_summary).
+
+    When `current_refs` is provided, ref-taking tools (click/fill/type_text/
+    select_option) are rejected with a helpful error if the ref isn't in the
+    latest snap — saves a wasted pinchtab roundtrip and educates the agent."""
+    # Guard against stale refs BEFORE hitting pinchtab. Reduces wasted LLM
+    # turns spent on confusing 500s like "Node is detached from document".
+    if (
+        current_refs is not None
+        and name in _REF_TAKING_TOOLS
+        and isinstance(params.get("ref"), str)
+        and params["ref"] not in current_refs
+    ):
+        return (_stale_ref_error(params["ref"], current_refs), False, None, None)
+
     try:
         if name == "click":
             res = await client.click(tab_id, params["ref"])
@@ -516,6 +556,23 @@ async def _execute_tool(
     except Exception as e:
         log.warning("tool %s raised: %s", name, e)
         return (f"ERROR: {type(e).__name__}: {e}", False, None, None)
+
+
+def _detect_tool_loop(
+    recent_tool_signatures: list[str], window: int = 5, threshold: int = 3
+) -> str | None:
+    """Watch the last `window` tool calls; if any (name, args) signature
+    repeats `threshold` times, return that signature. Returns None otherwise.
+
+    Saves the agent from itself when it loops on a stuck page (e.g. pressing
+    Enter + Tab + click repeatedly on a login form it can't solve)."""
+    if len(recent_tool_signatures) < threshold:
+        return None
+    tail = recent_tool_signatures[-window:]
+    for sig in set(tail):
+        if tail.count(sig) >= threshold:
+            return sig
+    return None
 
 
 def _trim_history_for_cli(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -664,6 +721,33 @@ async def run_task(
 
     def _publish(event_type: str, **fields):
         event_bus.publish(task_id, {"type": event_type, **fields})
+        # Persist for after-the-fact history view. A fresh short-lived
+        # session keeps the event-log commit independent of the runner's
+        # main transaction (so a runner rollback never loses the log,
+        # and a log-write failure never poisons the runner).
+        try:
+            payload = {}
+            for k, v in fields.items():
+                try:
+                    json.dumps(v)  # validate
+                    payload[k] = v
+                except (TypeError, ValueError):
+                    payload[k] = repr(v)[:500]
+            sess = db_factory()
+            try:
+                sess.add(
+                    TaskEvent(
+                        task_id=task_id,
+                        step=fields.get("step"),
+                        kind=event_type,
+                        payload_json=json.dumps(payload, ensure_ascii=False)[:8000],
+                    )
+                )
+                sess.commit()
+            finally:
+                sess.close()
+        except Exception as e:  # noqa: BLE001
+            log.warning("event persist failed (%s): %s", event_type, e)
 
     # Per-task log dir
     log_root = log_dir or (Path("logs") / time.strftime("%Y%m%d") / task_id[:8])
@@ -738,6 +822,7 @@ async def run_task(
         summary: str | None = None
         error_msg: str | None = None
         steps_taken = 0
+        recent_tool_signatures: list[str] = []
 
         start_unix = time.time()
 
@@ -756,6 +841,10 @@ async def run_task(
             (log_root / f"step-{step:03d}.png").write_bytes(screenshot)
             (log_root / f"step-{step:03d}.snap.txt").write_text(snap_text)
 
+            # Refs are scoped per-snap. Track this turn's set so we can
+            # reject stale refs from prior turns before they hit pinchtab.
+            current_refs = _extract_refs(snap_text)
+
             # Safety filter BEFORE any LLM call — prompt-injection mitigation.
             halt_p = detect_halt_pattern(snap_text)
             if halt_p:
@@ -763,38 +852,78 @@ async def run_task(
                 terminal_status = TaskStatus.halted
                 break
 
-            messages.append(build_user_message(snap_text, screenshot, step))
+            # Drain any human-injected hints into the upcoming user message
+            # so the agent sees them on this turn. Hints come from
+            # POST /tasks/{id}/hint via the dashboard.
+            hints = hint_box.drain(task_id)
+            user_msg = build_user_message(snap_text, screenshot, step)
+            if hints:
+                hint_text = "\n".join(f"[HUMAN HINT]: {h}" for h in hints)
+                # Append a text block to the user message with the hint.
+                if isinstance(user_msg.get("content"), list):
+                    user_msg["content"].append({"type": "text", "text": hint_text})
+                _publish("hint_delivered", step=step, count=len(hints))
+            messages.append(user_msg)
 
             # Mode detection: when the user did not supply an API key,
-            # _default_anthropic_factory returns a ClaudeCLIProvider. CLI
-            # has no prompt caching between subprocess calls, so we trim
-            # message history to a recent window and skip cache_control
-            # marking (which the CLI also ignores).
+            # _default_anthropic_factory returns a ClaudeCLIProvider. That
+            # provider is session-stateful — it consults `messages` to
+            # compute the delta since its previous call, so we send the
+            # full list. cache_control breakpoint is only for SDK mode.
             is_cli_mode = not (anthropic_api_key or "").strip()
-            if is_cli_mode:
-                send_messages = _trim_history_for_cli(messages)
-            else:
-                send_messages = messages
+            send_messages = messages
+            if not is_cli_mode:
                 _apply_message_cache_breakpoint(send_messages)
 
             _publish("llm_call", step=step, prompt_messages=len(send_messages))
+            # One retry on exception (CLI timeouts, transient SDK errors).
+            # For CLI mode, drop the half-written session before retrying so
+            # the next attempt starts a fresh `--session-id <new uuid>` rather
+            # than `--resume` into a possibly-stale session log.
+            response = None
+            last_exc: Exception | None = None
             t0 = time.time()
-            try:
-                response = await anthropic_client.messages.create(
-                    model=model,
-                    max_tokens=2048,
-                    system=system_blocks,
-                    tools=TOOLS,
-                    messages=send_messages,
-                )
-            except Exception as e:
+            for attempt in (1, 2):
+                try:
+                    response = await anthropic_client.messages.create(
+                        model=model,
+                        max_tokens=2048,
+                        system=system_blocks,
+                        tools=TOOLS,
+                        messages=send_messages,
+                    )
+                    last_exc = None
+                    break
+                except Exception as e:  # noqa: BLE001
+                    last_exc = e
+                    if attempt == 2:
+                        break
+                    _publish(
+                        "llm_retry",
+                        step=step,
+                        elapsed_seconds=round(time.time() - t0, 1),
+                        error=type(e).__name__,
+                        message=str(e)[:200],
+                    )
+                    # Reset CLI session if applicable. Safe for SDK mode too —
+                    # AsyncAnthropic has no session_id attribute, so it's a no-op.
+                    if hasattr(anthropic_client, "session_id"):
+                        anthropic_client.session_id = None
+                        if hasattr(anthropic_client, "_messages_sent_count"):
+                            anthropic_client._messages_sent_count = 0
+                    await asyncio.sleep(2.0)
+                    t0 = time.time()  # restart timer for the 2nd attempt
+            if last_exc is not None:
                 _publish(
                     "llm_done",
                     step=step,
                     elapsed_seconds=round(time.time() - t0, 1),
-                    error=type(e).__name__,
+                    error=type(last_exc).__name__,
                 )
-                error_msg = f"anthropic call at step {step}: {type(e).__name__}: {e}"
+                error_msg = (
+                    f"anthropic call at step {step}: "
+                    f"{type(last_exc).__name__}: {last_exc}"
+                )
                 terminal_status = TaskStatus.errored
                 break
             _publish("llm_done", step=step, elapsed_seconds=round(time.time() - t0, 1))
@@ -822,10 +951,44 @@ async def run_task(
                 terminal_status = TaskStatus.errored
                 break
 
+            # Tool-loop detector: track signatures of recent tool calls.
+            # Initialize once outside this loop; declare with nonlocal-like
+            # safety via the closing scope.
             tool_results: list[dict[str, Any]] = []
             stop_loop = False
             for tu in tool_uses:
                 _publish("tool_call", step=step, name=tu.name, params=dict(tu.input))
+
+                # Loop guard — if the agent has called the same (tool, args)
+                # 3 times in the last 5 turns, halt instead of letting it
+                # burn the rest of max_steps on the same wrong move.
+                import hashlib
+
+                sig_input = (tu.name, json.dumps(dict(tu.input), sort_keys=True))
+                sig = hashlib.md5(repr(sig_input).encode()).hexdigest()
+                recent_tool_signatures.append(sig)
+                recent_tool_signatures[:] = recent_tool_signatures[-10:]
+                if _detect_tool_loop(recent_tool_signatures):
+                    _publish(
+                        "loop_detected",
+                        step=step,
+                        tool=tu.name,
+                        params=dict(tu.input),
+                    )
+                    summary = (
+                        f"loop_detected: {tu.name}({json.dumps(dict(tu.input), ensure_ascii=False)[:100]}) "
+                        "called 3+ times in last 5 turns — agent appears stuck"
+                    )
+                    terminal_status = TaskStatus.halted
+                    stop_loop = True
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": "HALTED: tool-loop guard fired",
+                        }
+                    )
+                    break
 
                 # Special: human-in-the-loop input request. Runner pauses
                 # until the user fills the form via /tasks/{id}/provide-input.
@@ -881,7 +1044,8 @@ async def run_task(
                     continue
 
                 result_text, do_stop, term, term_summary = await _execute_tool(
-                    client, tab_id, tu.name, dict(tu.input), policy
+                    client, tab_id, tu.name, dict(tu.input), policy,
+                    current_refs=current_refs,
                 )
                 _publish("tool_result", step=step, name=tu.name, result=result_text[:200])
                 tool_results.append(
