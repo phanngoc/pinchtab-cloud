@@ -37,6 +37,26 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("pinchtab")
 
 
+def _dev_apply_pending_column_adds() -> None:
+    """Tiny dev-only schema patch: add columns that exist on the SQLAlchemy
+    model but not yet on the SQLite file (created_all is no-op for existing
+    tables). Production uses Alembic; this keeps dev painless without
+    forcing a DB wipe every time we add a Task field.
+
+    Pinned set of (table, column, ddl) — only columns nullable+defaulted
+    so an ADD COLUMN is safe on a populated row set."""
+    from sqlalchemy import text
+    pending = [
+        ("tasks", "claude_session_id", "ALTER TABLE tasks ADD COLUMN claude_session_id VARCHAR(64)"),
+    ]
+    with engine.begin() as conn:
+        for tbl, col, ddl in pending:
+            cols = {r[1] for r in conn.exec_driver_sql(f"PRAGMA table_info({tbl})").fetchall()}
+            if col not in cols:
+                conn.exec_driver_sql(ddl)
+                log.info("dev schema patch: added %s.%s", tbl, col)
+
+
 async def _warmup_claude_cli() -> None:
     """Pre-warm the claude CLI so the first real task's first-step latency
     isn't paying for: node.js boot, V8 JIT, OS file cache for ~/.claude/*,
@@ -84,6 +104,7 @@ async def lifespan(app: FastAPI):
     # Dev-mode auto-create. Production uses Alembic migrations.
     if settings.app_env != "production":
         Base.metadata.create_all(bind=engine)
+        _dev_apply_pending_column_adds()
 
     # Pinchtab client lives for the app's lifetime; reused across requests.
     # Tests override via `app.state.pinchtab = FakeClient()` before requests.

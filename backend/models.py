@@ -149,6 +149,12 @@ class Task(Base):
     # Pinchtab handles for this task's tab. Both set when the tab is opened.
     pinchtab_tab_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # claude CLI session UUID — captured after first successful LLM call when
+    # the CLI provider is in use. Lets us resume a halted task and reuse the
+    # same conversation history via `claude --resume <uuid>` instead of
+    # rebuilding context. None for SDK-mode tasks.
+    claude_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     task_description: Mapped[str] = mapped_column(Text, nullable=False)
     start_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 

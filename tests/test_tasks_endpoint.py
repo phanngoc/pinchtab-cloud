@@ -26,8 +26,8 @@ def _signup(c: TestClient) -> str:
 def _install_dispatcher_recorder(client: TestClient):
     calls: list[tuple[str, str]] = []
 
-    def fake_dispatch(task_id: str, api_key: str) -> None:
-        calls.append((task_id, api_key))
+    def fake_dispatch(task_id: str, api_key: str, *, resume: bool = False) -> None:
+        calls.append((task_id, api_key, resume))
 
     client.app.state.dispatcher = fake_dispatch
     return calls
@@ -214,6 +214,101 @@ def test_list_and_get_after_dispatch():
         r = c.get(f"/tasks/{task_id}", headers={"Authorization": f"Bearer {bearer}"})
         assert r.status_code == 200
         assert r.json()["id"] == task_id
+
+
+def test_resume_halted_task_dispatches_with_resume_flag():
+    """Halted task with saved tab + claude session can be resumed via
+    POST /tasks/{id}/resume; dispatcher receives resume=True and hint
+    is queued for the agent's next turn."""
+    from backend.db import SessionLocal
+    from backend.models import TaskStatus
+    from backend.task_input import hint_box
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        calls = _install_dispatcher_recorder(c)
+        # Create a task, then manually mark it halted + give it a saved tab.
+        r = c.post(
+            "/tasks",
+            json={"task_description": "resumable task", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        task_id = r.json()["id"]
+        sess = SessionLocal()
+        try:
+            t = sess.get(Task, task_id)
+            t.status = TaskStatus.halted
+            t.pinchtab_tab_id = "tab_FAKE"
+            t.claude_session_id = "session-uuid-fake"
+            sess.commit()
+        finally:
+            sess.close()
+
+        # Resume with a hint.
+        r = c.post(
+            f"/tasks/{task_id}/resume",
+            json={"hint": "click xuất bản đi", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 200, r.text
+        # Dispatcher received the resume flag.
+        resume_calls = [c for c in calls if c[2] is True]
+        assert len(resume_calls) == 1
+        assert resume_calls[0][0] == task_id
+        # Hint queued for the runner to drain.
+        assert "click xuất bản đi" in hint_box.peek(task_id)
+        hint_box.drain(task_id)  # cleanup
+
+
+def test_resume_rejects_non_halted_task():
+    """Resume on pending / running / done / errored → 409."""
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+        r = c.post(
+            "/tasks",
+            json={"task_description": "fresh task", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        task_id = r.json()["id"]
+        # Task is in pending status by default.
+        r = c.post(
+            f"/tasks/{task_id}/resume",
+            json={"anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 409
+        assert "halted" in r.json()["detail"].lower()
+
+
+def test_resume_rejects_task_without_saved_tab():
+    """Halted task that never opened a tab cannot be resumed."""
+    from backend.db import SessionLocal
+    from backend.models import TaskStatus
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+        r = c.post(
+            "/tasks",
+            json={"task_description": "halted task with no saved tab", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 201, r.text
+        task_id = r.json()["id"]
+        sess = SessionLocal()
+        try:
+            t = sess.get(Task, task_id)
+            t.status = TaskStatus.halted
+            t.pinchtab_tab_id = None  # never opened
+            sess.commit()
+        finally:
+            sess.close()
+        r = c.post(
+            f"/tasks/{task_id}/resume",
+            json={"anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 409
+        assert "no saved tab" in r.json()["detail"]
 
 
 def test_history_endpoint_returns_persisted_events():

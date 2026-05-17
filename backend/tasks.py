@@ -7,7 +7,7 @@ import re
 import secrets
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import FileResponse, StreamingResponse
@@ -104,7 +104,7 @@ def _ensure_under_cap(db: DbSession) -> None:
 # ---- Dispatcher hook (test-injectable via app.state) ----
 
 
-def _dispatch(task_id: str, api_key: str) -> None:
+def _dispatch(task_id: str, api_key: str, *, resume: bool = False) -> None:
     """Spawn the agent runner as a background asyncio task.
 
     Held in the module-level `registry` so we can cancel on user halt.
@@ -117,7 +117,7 @@ def _dispatch(task_id: str, api_key: str) -> None:
     """
     import logging
 
-    coro = run_task(task_id, anthropic_api_key=api_key)
+    coro = run_task(task_id, anthropic_api_key=api_key, resume=resume)
     asyncio_task = asyncio.create_task(coro, name=f"agent:{task_id}")
     registry.register(task_id, asyncio_task)
 
@@ -320,6 +320,73 @@ async def push_hint(
         )
     count = hint_box.push(task_id, body.message)
     return {"status": "queued", "pending_hints": count}
+
+
+class ResumeBody(BaseModel):
+    hint: str | None = Field(default=None, max_length=1000)
+    anthropic_api_key: SecretStr | None = None
+
+
+@router.post("/{task_id}/resume", response_model=TaskOut)
+async def resume_task(
+    task_id: str,
+    body: ResumeBody,
+    user: User = Depends(current_user),
+    db: DbSession = Depends(get_db),
+    dispatch: Callable = Depends(dispatch_for),
+) -> TaskOut:
+    """Resume a halted task. Optionally injects a hint as the next user
+    message so the agent gets explicit course-correction (e.g. when the
+    loop-detector halted it on a stuck page).
+
+    Preconditions:
+      - Task must be in `halted` state.
+      - Task must have a saved pinchtab_tab_id (set on initial run).
+      - In CLI mode the saved claude_session_id is restored so prior
+        conversation history is preserved via `claude --resume <uuid>`.
+    """
+    t = db.get(Task, task_id)
+    if t is None or t.user_id != user.id:
+        raise HTTPException(status_code=404, detail="not_found")
+    if t.status != TaskStatus.halted:
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is {t.status.value}; only halted tasks can be resumed",
+        )
+    if not t.pinchtab_tab_id:
+        raise HTTPException(
+            status_code=409,
+            detail="task has no saved tab; cannot resume — create a new task instead",
+        )
+    # Queue the hint BEFORE dispatch so the runner sees it on its first turn.
+    if body.hint and body.hint.strip():
+        hint_box.push(task_id, body.hint.strip())
+
+    # Resolve API key the same way create_task does: explicit > operator CLI.
+    api_key = ""
+    if body.anthropic_api_key is not None:
+        api_key = body.anthropic_api_key.get_secret_value().strip()
+    if not api_key:
+        from backend.llm_cli import is_operator
+        if not is_operator(user.email):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "api_key_required",
+                    "message": (
+                        "Provide a Claude API key in `anthropic_api_key`. "
+                        "Omitting the key falls back to the operator's CLI."
+                    ),
+                },
+            )
+    elif len(api_key) < 10:
+        raise HTTPException(
+            status_code=400, detail={"error": "anthropic_api_key_too_short"}
+        )
+
+    dispatch(task_id, api_key, resume=True)
+    db.refresh(t)
+    return _to_out(t)
 
 
 @router.post("/{task_id}/halt", response_model=TaskOut)

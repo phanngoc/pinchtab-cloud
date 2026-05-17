@@ -707,6 +707,7 @@ async def run_task(
     log_dir: Path | None = None,
     close_tab_on_finish: bool = True,
     bus: TaskBus | None = None,
+    resume: bool = False,
 ) -> AgentResult:
     """Run the agent loop for one task to a terminal state.
 
@@ -715,6 +716,13 @@ async def run_task(
     Cancellation: if this coroutine is cancelled (asyncio.Task.cancel called
     from the dispatcher), the task is marked `halted` and resources are
     cleaned up before re-raising CancelledError.
+
+    Resume mode (`resume=True`): the task must be in `halted` state and have
+    a saved `pinchtab_tab_id`. Skips instance/tab open + denylist apply (the
+    tab already has rules from its original run). For CLI provider, restores
+    `claude_session_id` so the model keeps its prior conversation history.
+    For SDK provider, resume is currently a fresh-context restart (the SDK
+    has no equivalent of `--resume`).
     """
     policy = denylist_policy or DenylistPolicy()
     event_bus = bus if bus is not None else default_bus
@@ -777,36 +785,73 @@ async def run_task(
         task = db.get(Task, task_id)
         if task is None:
             raise RuntimeError(f"task {task_id} not found")
-        if task.status != TaskStatus.pending:
-            raise RuntimeError(f"task {task_id} not pending (status={task.status.value})")
 
-        profile = db.get(Profile, task.profile_id)
-        if profile is None:
-            raise RuntimeError(f"profile {task.profile_id} not found")
-
-        # Bring instance online + open tab + apply denylist
-        instance_id = await ensure_instance(client, profile, db)
-        try:
-            tab_id, rules_installed = await _open_tab_and_secure(
-                client, instance_id, task.start_url, policy
-            )
-        except Exception as e:
-            task.error_message = f"open_tab/apply_denylist failed: {e}"
-            task.transition(TaskStatus.errored)
+        if resume:
+            if task.status != TaskStatus.halted:
+                raise RuntimeError(
+                    f"task {task_id} not halted (status={task.status.value}); "
+                    "only halted tasks can be resumed"
+                )
+            if not task.pinchtab_tab_id:
+                raise RuntimeError(
+                    f"task {task_id} has no saved tab — cannot resume"
+                )
+            tab_id = task.pinchtab_tab_id
+            rules_installed = -1  # already applied in original run; not re-counted
+            instance_id = "(resumed)"
+            # Restore CLI session so claude --resume <uuid> picks up where it left off.
+            if (
+                hasattr(anthropic_client, "session_id")
+                and task.claude_session_id
+            ):
+                anthropic_client.session_id = task.claude_session_id
+                if hasattr(anthropic_client, "_messages_sent_count"):
+                    anthropic_client._messages_sent_count = 0
+            task.transition(TaskStatus.running)
+            task.error_message = None  # clear prior halt reason
             db.commit()
-            return AgentResult(terminal=TaskStatus.errored, error_message=task.error_message)
+            db.refresh(task)
+            log.info(
+                "task %s RESUMED on tab %s (claude session %s)",
+                task_id, tab_id,
+                (task.claude_session_id or "<none>")[:8],
+            )
+            _publish(
+                "resumed",
+                tab_id=tab_id,
+                claude_session=(task.claude_session_id or "")[:8],
+            )
+        else:
+            if task.status != TaskStatus.pending:
+                raise RuntimeError(f"task {task_id} not pending (status={task.status.value})")
 
-        task.pinchtab_tab_id = tab_id
-        task.transition(TaskStatus.running)
-        db.commit()
-        db.refresh(task)
-        log.info("task %s running on tab %s (denylist rules: %d)", task_id, tab_id, rules_installed)
-        _publish(
-            "started",
-            tab_id=tab_id,
-            instance_id=instance_id,
-            denylist_rules=rules_installed,
-        )
+            profile = db.get(Profile, task.profile_id)
+            if profile is None:
+                raise RuntimeError(f"profile {task.profile_id} not found")
+
+            # Bring instance online + open tab + apply denylist
+            instance_id = await ensure_instance(client, profile, db)
+            try:
+                tab_id, rules_installed = await _open_tab_and_secure(
+                    client, instance_id, task.start_url, policy
+                )
+            except Exception as e:
+                task.error_message = f"open_tab/apply_denylist failed: {e}"
+                task.transition(TaskStatus.errored)
+                db.commit()
+                return AgentResult(terminal=TaskStatus.errored, error_message=task.error_message)
+
+            task.pinchtab_tab_id = tab_id
+            task.transition(TaskStatus.running)
+            db.commit()
+            db.refresh(task)
+            log.info("task %s running on tab %s (denylist rules: %d)", task_id, tab_id, rules_installed)
+            _publish(
+                "started",
+                tab_id=tab_id,
+                instance_id=instance_id,
+                denylist_rules=rules_installed,
+            )
 
         # Agent loop
         system_blocks = [
@@ -913,6 +958,20 @@ async def run_task(
                             anthropic_client._messages_sent_count = 0
                     await asyncio.sleep(2.0)
                     t0 = time.time()  # restart timer for the 2nd attempt
+            # Persist the CLI session_id on the task row right after the
+             # first successful call so a future resume can pick it up.
+            if (
+                response is not None
+                and hasattr(anthropic_client, "session_id")
+                and anthropic_client.session_id
+                and task.claude_session_id != anthropic_client.session_id
+            ):
+                try:
+                    task.claude_session_id = anthropic_client.session_id
+                    db.commit()
+                except Exception as _e:  # noqa: BLE001
+                    log.warning("save claude_session_id failed: %s", _e)
+                    db.rollback()
             if last_exc is not None:
                 _publish(
                     "llm_done",
@@ -1082,7 +1141,9 @@ async def run_task(
         db.add(UsageMetric(user_id=task.user_id, task_id=task.id, minutes=minutes))
         db.commit()
 
-        if close_tab_on_finish:
+        # Keep the tab alive on `halted` so the user can resume via
+        # POST /tasks/{id}/resume. Close on `done` and `errored`.
+        if close_tab_on_finish and terminal_status != TaskStatus.halted:
             try:
                 await client.close_tab(tab_id)
             except Exception as e:

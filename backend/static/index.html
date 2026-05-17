@@ -179,6 +179,7 @@
     </div>
     <div style="margin-top: 10px" class="row">
       <button onclick="haltTask()" id="btn-halt" class="ghost" style="flex: 0 0 140px" disabled>Halt</button>
+      <button onclick="resumeTask()" id="btn-resume" class="ghost hidden" style="flex: 0 0 160px">▶ Resume + hint</button>
       <button onclick="resetView()" class="ghost" style="flex: 0 0 140px">Tasks mới</button>
     </div>
     <div id="task-summary" class="muted" style="margin-top: 10px"></div>
@@ -602,6 +603,9 @@ function appendEvent(ev){
     case 'hint_delivered':
       body = `<span style="color:#ffd166">📨 ${ev.count} hint(s) delivered to agent this turn</span>`;
       break;
+    case 'resumed':
+      body = `<span style="color:var(--accent)">▶ resumed</span>${ev.hint ? ` with hint: <i>${escapeHtml(ev.hint)}</i>` : ''} <span class="muted">tab=${escapeHtml(ev.tab_id || '')}</span>`;
+      break;
     case 'loop_detected':
       body = `<span style="color:var(--err)">🔁 loop detected — agent called <b>${escapeHtml(ev.tool)}</b> 3+ times in last 5 turns. Halting.</span>`;
       break;
@@ -711,6 +715,13 @@ function onTerminal(ev){
   $('task-status').textContent = ev.status;
   $('task-status').className = 'pill ' + statusClass(ev.status);
   $('btn-halt').disabled = true;
+  // Only halted tasks are resumable (tab kept alive, claude session preserved).
+  const resumeBtn = $('btn-resume');
+  if (ev.status === 'halted') {
+    resumeBtn.classList.remove('hidden');
+  } else {
+    resumeBtn.classList.add('hidden');
+  }
   if (ev.summary) {
     $('task-summary').innerHTML = `<b>Summary:</b> ${escapeHtml(ev.summary)}`;
   } else if (ev.error) {
@@ -784,6 +795,29 @@ async function sendHint(){
   }
   appendEvent({type:'hint_sent', message: txt});
   $('hint-input').value = '';
+}
+
+async function resumeTask(){
+  if (!currentTaskId) return;
+  const hint = $('hint-input').value.trim();
+  const r = await fetch(`/tasks/${currentTaskId}/resume`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json', 'authorization': `Bearer ${currentBearer}`},
+    body: JSON.stringify(hint ? {hint} : {}),
+  });
+  if (!r.ok) {
+    const j = await r.json().catch(()=>({}));
+    alert(`Resume failed: ${r.status} ${JSON.stringify(j.detail || j)}`);
+    return;
+  }
+  $('hint-input').value = '';
+  $('btn-resume').classList.add('hidden');
+  $('btn-halt').disabled = false;
+  $('event-log').innerHTML = '';
+  appendEvent({type:'resumed', hint: hint || null});
+  // Re-open the SSE stream for the resumed run.
+  if (currentStreamAbort) { currentStreamAbort.abort(); currentStreamAbort = null; }
+  streamEvents(currentTaskId);
 }
 
 async function haltTask(){
