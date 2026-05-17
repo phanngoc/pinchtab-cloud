@@ -26,8 +26,8 @@ def _signup(c: TestClient) -> str:
 def _install_dispatcher_recorder(client: TestClient):
     calls: list[tuple[str, str]] = []
 
-    def fake_dispatch(task_id: str, api_key: str) -> None:
-        calls.append((task_id, api_key))
+    def fake_dispatch(task_id: str, api_key: str, *, resume: bool = False) -> None:
+        calls.append((task_id, api_key, resume))
 
     client.app.state.dispatcher = fake_dispatch
     return calls
@@ -118,7 +118,9 @@ def test_dispatch_failure_marks_task_errored_and_returns_500():
         assert r.json()["detail"] == "dispatch_failed"
 
 
-def test_post_tasks_requires_api_key():
+def test_post_tasks_omitted_key_requires_operator():
+    """Missing key falls back to CLI provider — restricted to operator email.
+    Non-operator without a key gets 400 api_key_required."""
     with TestClient(app) as c:
         bearer = _signup(c)
         _install_dispatcher_recorder(c)
@@ -128,10 +130,51 @@ def test_post_tasks_requires_api_key():
             json={"task_description": "missing api key on purpose"},
             headers={"Authorization": f"Bearer {bearer}"},
         )
-        assert r.status_code == 422
-        # Pydantic validation error mentioning the missing field.
+        # Without OPERATOR_EMAIL set, no one is the operator → 400.
+        assert r.status_code == 400
         body = r.json()
-        assert any("anthropic_api_key" in str(e) for e in body.get("detail", []))
+        assert body["detail"]["error"] == "api_key_required"
+
+
+def test_post_tasks_short_key_rejected():
+    """A non-empty key shorter than 10 chars is rejected."""
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+
+        r = c.post(
+            "/tasks",
+            json={
+                "task_description": "short api key on purpose to test rejection",
+                "anthropic_api_key": "tooshort",
+            },
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 400
+        assert r.json()["detail"]["error"] == "anthropic_api_key_too_short"
+
+
+def test_post_tasks_omitted_key_works_for_operator(monkeypatch):
+    """When OPERATOR_EMAIL is set and the user matches, omitted key is OK
+    and the dispatcher receives an empty string (run_task picks CLI provider)."""
+    with TestClient(app) as c:
+        bearer = _signup(c)  # this helper hard-codes alice@example.com
+        calls = _install_dispatcher_recorder(c)
+        monkeypatch.setenv("OPERATOR_EMAIL", "alice@example.com")
+        # The is_operator helper consults settings + env; refresh settings cache.
+        from backend.config import get_settings
+        get_settings.cache_clear()
+
+        r = c.post(
+            "/tasks",
+            json={"task_description": "operator fallback to CLI, no key"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 201, r.text
+        # Dispatcher was called with empty api_key — runner will pick CLI.
+        assert len(calls) == 1
+        assert calls[0][1] == ""
+        get_settings.cache_clear()
 
 
 def test_halt_returns_409_when_not_running():
@@ -171,6 +214,173 @@ def test_list_and_get_after_dispatch():
         r = c.get(f"/tasks/{task_id}", headers={"Authorization": f"Bearer {bearer}"})
         assert r.status_code == 200
         assert r.json()["id"] == task_id
+
+
+def test_resume_halted_task_dispatches_with_resume_flag():
+    """Halted task with saved tab + claude session can be resumed via
+    POST /tasks/{id}/resume; dispatcher receives resume=True and hint
+    is queued for the agent's next turn."""
+    from backend.db import SessionLocal
+    from backend.models import TaskStatus
+    from backend.task_input import hint_box
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        calls = _install_dispatcher_recorder(c)
+        # Create a task, then manually mark it halted + give it a saved tab.
+        r = c.post(
+            "/tasks",
+            json={"task_description": "resumable task", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        task_id = r.json()["id"]
+        sess = SessionLocal()
+        try:
+            t = sess.get(Task, task_id)
+            t.status = TaskStatus.halted
+            t.pinchtab_tab_id = "tab_FAKE"
+            t.claude_session_id = "session-uuid-fake"
+            sess.commit()
+        finally:
+            sess.close()
+
+        # Resume with a hint.
+        r = c.post(
+            f"/tasks/{task_id}/resume",
+            json={"hint": "click xuất bản đi", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 200, r.text
+        # Dispatcher received the resume flag.
+        resume_calls = [c for c in calls if c[2] is True]
+        assert len(resume_calls) == 1
+        assert resume_calls[0][0] == task_id
+        # Hint queued for the runner to drain.
+        assert "click xuất bản đi" in hint_box.peek(task_id)
+        hint_box.drain(task_id)  # cleanup
+
+
+def test_resume_rejects_non_halted_task():
+    """Resume on pending / running / done / errored → 409."""
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+        r = c.post(
+            "/tasks",
+            json={"task_description": "fresh task", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        task_id = r.json()["id"]
+        # Task is in pending status by default.
+        r = c.post(
+            f"/tasks/{task_id}/resume",
+            json={"anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 409
+        assert "halted" in r.json()["detail"].lower()
+
+
+def test_resume_rejects_task_without_saved_tab():
+    """Halted task that never opened a tab cannot be resumed."""
+    from backend.db import SessionLocal
+    from backend.models import TaskStatus
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+        r = c.post(
+            "/tasks",
+            json={"task_description": "halted task with no saved tab", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 201, r.text
+        task_id = r.json()["id"]
+        sess = SessionLocal()
+        try:
+            t = sess.get(Task, task_id)
+            t.status = TaskStatus.halted
+            t.pinchtab_tab_id = None  # never opened
+            sess.commit()
+        finally:
+            sess.close()
+        r = c.post(
+            f"/tasks/{task_id}/resume",
+            json={"anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 409
+        assert "no saved tab" in r.json()["detail"]
+
+
+def test_history_endpoint_returns_persisted_events():
+    """End-to-end: a task with persisted TaskEvent rows is queryable via
+    GET /tasks/{id}/history and respects since_id incremental loading."""
+    from backend.db import SessionLocal
+    from backend.models import TaskEvent
+    with TestClient(app) as c:
+        bearer = _signup(c)
+        _install_dispatcher_recorder(c)
+        r = c.post(
+            "/tasks",
+            json={"task_description": "task with history", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        task_id = r.json()["id"]
+
+        # Simulate runner persisting events (real runner does this via _publish).
+        sess = SessionLocal()
+        try:
+            sess.add(TaskEvent(task_id=task_id, step=1, kind="step", payload_json='{"step": 1}'))
+            sess.add(TaskEvent(task_id=task_id, step=1, kind="tool_call", payload_json='{"name": "scroll", "params": {"amount": "500"}}'))
+            sess.add(TaskEvent(task_id=task_id, step=None, kind="terminal", payload_json='{"status": "done", "steps": 1}'))
+            sess.commit()
+        finally:
+            sess.close()
+
+        r = c.get(f"/tasks/{task_id}/history", headers={"Authorization": f"Bearer {bearer}"})
+        assert r.status_code == 200
+        events = r.json()
+        assert len(events) == 3
+        assert [e["kind"] for e in events] == ["step", "tool_call", "terminal"]
+        assert events[1]["payload"]["name"] == "scroll"
+        assert events[2]["step"] is None
+
+        # since_id pagination
+        last_id = events[0]["id"]
+        r = c.get(
+            f"/tasks/{task_id}/history?since_id={last_id}",
+            headers={"Authorization": f"Bearer {bearer}"},
+        )
+        assert r.status_code == 200
+        assert len(r.json()) == 2
+
+
+def test_history_endpoint_rejects_other_users_task():
+    """A user querying another user's task history gets 404, not 403."""
+    from backend.db import SessionLocal
+    from backend.models import TaskEvent
+    with TestClient(app) as c:
+        bearer_a = _signup(c)
+        _install_dispatcher_recorder(c)
+        ra = c.post(
+            "/tasks",
+            json={"task_description": "alice task", "anthropic_api_key": "sk-ant-test-1234567890"},
+            headers={"Authorization": f"Bearer {bearer_a}"},
+        )
+        task_id = ra.json()["id"]
+        sess = SessionLocal()
+        try:
+            sess.add(TaskEvent(task_id=task_id, kind="step", payload_json="{}"))
+            sess.commit()
+        finally:
+            sess.close()
+
+        # Bob signs up + tries to read Alice's task.
+        rb = c.post("/auth/request-link", json={"email": "bob@example.com"})
+        bob_token = rb.json()["dev_link"].split("token=", 1)[1]
+        bob_bearer = c.post("/auth/verify", json={"token": bob_token}).json()["bearer"]
+
+        r = c.get(f"/tasks/{task_id}/history", headers={"Authorization": f"Bearer {bob_bearer}"})
+        assert r.status_code == 404
 
 
 def test_second_task_reuses_same_profile():

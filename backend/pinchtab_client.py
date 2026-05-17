@@ -58,7 +58,7 @@ class RouteRule:
     """Mirrors pinchtab's bridge.RouteRule wire format."""
 
     pattern: str
-    action: Literal["block", "fulfill", "continue"] = "block"
+    action: Literal["abort", "fulfill", "continue"] = "abort"
     resourceType: str | None = None   # "document" | "xhr" | "fetch" | "image" | ...
     method: str | None = None         # "GET" | "POST" | ...
     status: int | None = None         # for fulfill rules
@@ -75,13 +75,23 @@ class PinchtabClient:
         base_url: str = "http://127.0.0.1:9867",
         timeout: float = 30.0,
         *,
+        token: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
     ):
         """`transport` is a hook for tests — pass an httpx.MockTransport to
-        intercept calls without spinning up a real network client."""
+        intercept calls without spinning up a real network client.
+
+        `token` is the pinchtab API token (server.token in ~/.pinchtab/config.json).
+        Sent on every request as `Authorization: Bearer <token>`. Required by
+        pinchtab 0.8+; harmless on older versions.
+        """
         self._base = base_url.rstrip("/")
+        headers = {"Authorization": f"Bearer {token}"} if token else None
         self._client = httpx.AsyncClient(
-            timeout=timeout, base_url=self._base, transport=transport
+            timeout=timeout,
+            base_url=self._base,
+            transport=transport,
+            headers=headers,
         )
 
     async def aclose(self) -> None:
@@ -128,6 +138,22 @@ class PinchtabClient:
                 return None
             raise
 
+    async def create_profile(
+        self, *, name: str, description: str = ""
+    ) -> dict[str, Any]:
+        """Create a new pinchtab profile. Returns the full profile object
+        including the `id` (which is what `/instances/start` accepts as
+        `profileId`). Pinchtab does not auto-create profiles on instance
+        start — POST /profiles is required first."""
+        return await self._json(
+            "POST",
+            "/profiles",
+            json={"name": name, "description": description},
+        )
+
+    async def list_profiles(self) -> list[dict[str, Any]]:
+        return await self._json("GET", "/profiles") or []
+
     async def start_instance(
         self, *, profile_id: str, mode: str = "headless"
     ) -> dict[str, Any]:
@@ -170,6 +196,15 @@ class PinchtabClient:
 
     # ---- Inspection ----
 
+    # Pinchtab role names worth surfacing to the agent. Everything else
+    # (StaticText decorations, generic listitem containers, etc.) gets
+    # dropped to keep the snap compact.
+    _SNAP_ROLES = frozenset({
+        "button", "link", "textbox", "searchbox", "combobox",
+        "checkbox", "radio", "switch", "menuitem", "tab",
+        "img", "image", "heading", "form",
+    })
+
     async def snapshot(
         self,
         tab_id: str,
@@ -178,6 +213,17 @@ class PinchtabClient:
         compact: bool = True,
         max_tokens: int | None = None,
     ) -> str:
+        """Returns a SHORT human-readable accessibility snapshot.
+
+        Pinchtab's /snapshot endpoint returns verbose JSON even with
+        compact=true (each node has nodeId/frameId/frameUrl metadata that
+        the agent doesn't need). We parse the JSON and emit one line per
+        interactive node: `eN:role "name"`. Empirical: ~5x smaller than
+        raw JSON, which makes a huge latency difference when feeding the
+        text to the claude CLI subprocess (no prompt caching there).
+        """
+        import json as _json
+
         params: dict[str, Any] = {
             "interactive": "true" if interactive else "false",
             "compact": "true" if compact else "false",
@@ -185,40 +231,102 @@ class PinchtabClient:
         if max_tokens:
             params["maxTokens"] = str(max_tokens)
         r = await self._request("GET", f"/tabs/{tab_id}/snapshot", params=params)
-        return r.text
+        raw = r.text
+        try:
+            data = _json.loads(raw)
+        except Exception:
+            # Old binaries / unexpected payloads — pass through verbatim.
+            return raw
+        lines: list[str] = []
+        title = data.get("title", "")
+        url = data.get("url", "")
+        nodes = data.get("nodes", []) or []
+        lines.append(f"# {title} | {url} | {len(nodes)} nodes")
+        for n in nodes:
+            role = (n.get("role") or "").lower()
+            tag = (n.get("tag") or "").lower()
+            name = n.get("name") or n.get("text") or n.get("placeholder") or ""
+            ref = n.get("ref", "")
+            if role not in self._SNAP_ROLES and tag not in {"a", "button", "input", "textarea", "select"}:
+                continue
+            if not ref:
+                continue
+            # Trim each line to keep snap small even on huge pages.
+            label = " ".join(name.split())[:80]
+            lines.append(f'{ref}:{role or tag} "{label}"')
+        if data.get("truncated"):
+            lines.append("# (truncated by maxTokens)")
+        return "\n".join(lines)
 
     async def screenshot(self, tab_id: str, *, quality: int = 70) -> bytes:
+        """Returns raw image bytes (JPEG or PNG depending on pinchtab config).
+
+        Pinchtab returns JSON {"base64": "...", "encoding": "...", "size": N}
+        rather than raw image bytes, so we decode here. Callers detect the
+        actual MIME type from magic bytes."""
+        import base64 as _b64
+
         r = await self._request(
             "GET", f"/tabs/{tab_id}/screenshot", params={"quality": str(quality)}
         )
+        # Try JSON wrapper first (current pinchtab behavior).
+        ct = r.headers.get("content-type", "")
+        if "application/json" in ct:
+            data = r.json()
+            b64 = data.get("base64") or data.get("data") or ""
+            return _b64.b64decode(b64) if b64 else b""
+        # Fallback: raw image bytes (older or different pinchtab build).
         return r.content
 
-    async def text(self, tab_id: str) -> str:
-        r = await self._request("GET", f"/tabs/{tab_id}/text")
+    async def text(self, tab_id: str, *, selector: str | None = None) -> str:
+        """Return readable page text. With `selector`, returns text from one
+        element (ref like 'e7' or CSS like '#article-body')."""
+        params: dict[str, Any] = {}
+        if selector:
+            params["selector"] = selector
+        r = await self._request("GET", f"/tabs/{tab_id}/text", params=params or None)
+        # Pinchtab may return either text or JSON {text: "..."}; handle both.
+        ct = r.headers.get("content-type", "")
+        if "application/json" in ct:
+            try:
+                data = r.json()
+                return data.get("text", "") if isinstance(data, dict) else r.text
+            except Exception:
+                return r.text
         return r.text
+
+    async def find(self, tab_id: str, query: str) -> dict[str, Any]:
+        """Semantic find — natural-language description → ref. Calls
+        pinchtab's POST /tabs/{id}/find endpoint."""
+        return await self._json(
+            "POST", f"/tabs/{tab_id}/find", json={"query": query}
+        )
 
     # ---- Actions ----
 
     async def _action(self, tab_id: str, payload: dict[str, Any]) -> dict[str, Any]:
         return await self._json("POST", f"/tabs/{tab_id}/action", json=payload)
 
+    # Pinchtab's POST /tabs/{id}/action expects `kind` as the action name field
+    # (constants in pinchtab/internal/bridge/action_registry.go: click/type/fill/
+    # press/select/scroll). Sending `type` returns 400 missing_field 'kind'.
     async def click(self, tab_id: str, ref: str) -> dict[str, Any]:
-        return await self._action(tab_id, {"type": "click", "ref": ref})
+        return await self._action(tab_id, {"kind": "click", "ref": ref})
 
     async def type_text(self, tab_id: str, ref: str, text: str) -> dict[str, Any]:
-        return await self._action(tab_id, {"type": "type", "ref": ref, "text": text})
+        return await self._action(tab_id, {"kind": "type", "ref": ref, "text": text})
 
     async def fill(self, tab_id: str, ref: str, text: str) -> dict[str, Any]:
-        return await self._action(tab_id, {"type": "fill", "ref": ref, "text": text})
+        return await self._action(tab_id, {"kind": "fill", "ref": ref, "text": text})
 
     async def press_key(self, tab_id: str, key: str) -> dict[str, Any]:
-        return await self._action(tab_id, {"type": "press", "key": key})
+        return await self._action(tab_id, {"kind": "press", "key": key})
 
     async def scroll(self, tab_id: str, amount: str | int) -> dict[str, Any]:
-        return await self._action(tab_id, {"type": "scroll", "amount": str(amount)})
+        return await self._action(tab_id, {"kind": "scroll", "amount": str(amount)})
 
     async def select_option(self, tab_id: str, ref: str, value: str) -> dict[str, Any]:
-        return await self._action(tab_id, {"type": "select", "ref": ref, "value": value})
+        return await self._action(tab_id, {"kind": "select", "ref": ref, "value": value})
 
     # ---- Network interception (denylist enforcement) ----
 
@@ -249,7 +357,7 @@ class PinchtabClient:
                 continue
             for pattern in (f"*://*.{domain}/*", f"*://{domain}/*"):
                 await self.add_route_rule(
-                    tab_id, RouteRule(pattern=pattern, action="block")
+                    tab_id, RouteRule(pattern=pattern, action="abort")
                 )
                 installed += 1
         return installed

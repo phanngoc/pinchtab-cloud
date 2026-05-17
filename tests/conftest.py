@@ -10,6 +10,10 @@ os.environ.setdefault("APP_SECRET_KEY", "test-secret-test-secret-test-secret-32b
 os.environ.setdefault("WORKER_SHARED_SECRET", "test-worker-test-worker-test-worker-32b")
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("APP_ENV", "test")
+# Tests assume the default Anthropic SDK provider (no operator gate).
+# Force override even if developer's local .env sets LLM_PROVIDER=claude_cli.
+os.environ["LLM_PROVIDER"] = "anthropic_sdk"
+os.environ["OPERATOR_EMAIL"] = ""
 
 import pytest
 

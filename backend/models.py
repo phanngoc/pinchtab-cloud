@@ -149,6 +149,12 @@ class Task(Base):
     # Pinchtab handles for this task's tab. Both set when the tab is opened.
     pinchtab_tab_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # claude CLI session UUID — captured after first successful LLM call when
+    # the CLI provider is in use. Lets us resume a halted task and reuse the
+    # same conversation history via `claude --resume <uuid>` instead of
+    # rebuilding context. None for SDK-mode tasks.
+    claude_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     task_description: Mapped[str] = mapped_column(Text, nullable=False)
     start_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -177,6 +183,32 @@ class Task(Base):
             self.started_at = now
         if new in (TaskStatus.done, TaskStatus.errored):
             self.ended_at = now
+
+
+class TaskEvent(Base):
+    """Append-only timeline of agent events per task.
+
+    Mirrors every SSE event the runner emits (step, llm_call, llm_done,
+    tool_call, tool_result, loop_detected, hint_delivered, awaiting_input,
+    terminal, etc.) so the dashboard can render full run history after
+    the live stream is gone. payload_json is the event dict minus `type`,
+    truncated at 8 KB per row.
+    """
+
+    __tablename__ = "task_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("tasks.id"), index=True, nullable=False
+    )
+    step: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, nullable=False, index=True
+    )
+
+    __table_args__ = (Index("ix_task_event_task_created", "task_id", "created_at"),)
 
 
 class StripeEvent(Base):

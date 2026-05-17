@@ -73,15 +73,37 @@ async def test_navigate_uses_tab_scoped_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_snapshot_passes_query_params():
+async def test_snapshot_reformats_json_to_compact_text():
+    """Pinchtab returns verbose JSON; client reformats to one terse line
+    per interactive node."""
+    import json
+
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text="e1:button \"Login\"\ne2:textbox \"Email\"\n")
+        body = json.dumps({
+            "title": "Some Page",
+            "url": "https://example.com/",
+            "count": 4,
+            "nodes": [
+                {"ref": "e0", "role": "RootWebArea", "name": "Some Page"},
+                {"ref": "e1", "role": "button", "name": "Login", "tag": "button"},
+                {"ref": "e2", "role": "textbox", "name": "Email", "tag": "input"},
+                {"ref": "e3", "role": "StaticText", "name": "Footer text"},
+            ],
+        })
+        return httpx.Response(200, text=body)
 
     c = make_client(handler)
-    out = await c.snapshot("tab_x", interactive=True, compact=True, max_tokens=2000)
+    out = await c.snapshot("tab_x", interactive=True, compact=True)
     await c.aclose()
-    assert "Login" in out
-    # not asserting params here — covered in the call recorder test below
+    # Header line
+    assert "Some Page" in out
+    assert "https://example.com/" in out
+    # Interactive elements included
+    assert 'e1:button "Login"' in out
+    assert 'e2:textbox "Email"' in out
+    # Decorative nodes dropped
+    assert "Footer text" not in out
+    assert "RootWebArea" not in out
 
 
 @pytest.mark.asyncio
@@ -109,7 +131,7 @@ async def test_click_dispatches_to_action_endpoint():
     await c.aclose()
     assert calls[0].url.path == "/tabs/tab_x/action"
     payload = calls[0].read()
-    assert b'"type":"click"' in payload.replace(b" ", b"")
+    assert b'"kind":"click"' in payload.replace(b" ", b"")
     assert b'"ref":"e7"' in payload.replace(b" ", b"")
 
 
@@ -120,7 +142,7 @@ async def test_type_text_includes_text_field():
     await c.type_text("tab_x", "e6", "hello world")
     await c.aclose()
     payload = calls[0].read()
-    assert b'"type":"type"' in payload.replace(b" ", b"")
+    assert b'"kind":"type"' in payload.replace(b" ", b"")
     assert b"hello world" in payload
 
 
@@ -128,13 +150,13 @@ async def test_type_text_includes_text_field():
 async def test_add_route_rule_serializes_correctly():
     handler, calls = _recorder()
     c = make_client(handler)
-    rule = RouteRule(pattern="*://*.shopee.vn/*", action="block")
+    rule = RouteRule(pattern="*://*.shopee.vn/*", action="abort")
     await c.add_route_rule("tab_x", rule)
     await c.aclose()
     assert calls[0].url.path == "/tabs/tab_x/network/route"
     body = calls[0].read()
     assert b"shopee.vn" in body
-    assert b'"action":"block"' in body.replace(b" ", b"")
+    assert b'"action":"abort"' in body.replace(b" ", b"")
     # Optional fields not set should not be in payload.
     assert b"resourceType" not in body
     assert b"method" not in body
